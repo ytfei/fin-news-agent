@@ -1,0 +1,1042 @@
+openapi: 3.1.0
+info:
+  title: fin-news-v5 API
+  version: 1.0.0
+  description: >
+    财经资讯分析 Agent 数据服务。
+    提供资讯流、深度分析报告、盘前/盘后简报、市场概览、语义检索、个股视图与追问会话。
+    所有分析与问答内容均为 AI 生成，仅供参考，不构成投资建议。
+servers:
+  - url: http://localhost:8000/api/v1
+    description: local
+  - url: https://api.example.com/api/v1
+    description: production
+
+tags:
+  - name: news
+  - name: analysis
+  - name: market
+  - name: search
+  - name: stocks
+  - name: chat
+  - name: admin
+  - name: system
+
+security:
+  - DeviceAuth: []
+
+paths:
+  /health:
+    get:
+      tags: [system]
+      summary: 健康检查
+      security: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, enum: [ok, degraded, down] }
+                  db: { type: string, enum: [up, down] }
+                  llm: { type: string, enum: [up, down, unknown] }
+                  event_backlog: { type: integer, description: PENDING 事件数 }
+                  version: { type: string }
+                  time: { type: string, format: date-time }
+
+  # ------------------------------ NEWS ------------------------------
+  /news:
+    get:
+      tags: [news]
+      summary: 资讯流（分页）
+      operationId: listNews
+      parameters:
+        - $ref: "#/components/parameters/Page"
+        - $ref: "#/components/parameters/PageSize"
+        - name: band
+          in: query
+          description: 分档过滤，可多选
+          schema:
+            type: array
+            items: { $ref: "#/components/schemas/ScoreBand" }
+          style: form
+          explode: false
+        - name: min_score
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 10 }
+        - name: max_score
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 10 }
+        - name: start
+          in: query
+          description: 起始时间（ISO8601，默认近 24 小时）
+          schema: { type: string, format: date-time }
+        - name: end
+          in: query
+          schema: { type: string, format: date-time }
+        - name: source
+          in: query
+          description: 来源标识，如 cls / sina / yicai
+          schema: { type: array, items: { type: string } }
+        - name: kind
+          in: query
+          schema: { $ref: "#/components/schemas/IngestKind" }
+        - name: q
+          in: query
+          description: 标题关键词（pg_trgm 模糊匹配）
+          schema: { type: string }
+        - name: code
+          in: query
+          description: 关联标的代码过滤，如 600519.SH
+          schema: { type: string }
+        - name: has_analysis
+          in: query
+          schema: { type: boolean }
+        - name: sort
+          in: query
+          schema:
+            type: string
+            enum: [publish_time, score, impact]
+            default: publish_time
+        - name: order
+          in: query
+          schema: { type: string, enum: [asc, desc], default: desc }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/PageMeta"
+                  - type: object
+                    properties:
+                      items:
+                        type: array
+                        items: { $ref: "#/components/schemas/NewsItem" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+  /news/{news_id}:
+    get:
+      tags: [news]
+      summary: 资讯详情
+      operationId: getNews
+      parameters: [{ $ref: "#/components/parameters/NewsId" }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/NewsDetail" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /news/{news_id}/analysis:
+    get:
+      tags: [news]
+      summary: 某条资讯的分析报告
+      operationId: getNewsAnalysis
+      parameters: [{ $ref: "#/components/parameters/NewsId" }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AnalysisReport" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /news/{news_id}/related:
+    get:
+      tags: [news]
+      summary: 语义相似的历史资讯
+      operationId: getRelatedNews
+      parameters:
+        - { $ref: "#/components/parameters/NewsId" }
+        - { name: limit, in: query, schema: { type: integer, default: 10, maximum: 50 } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/RelatedNews" }
+
+  # ---------------------------- ANALYSIS ----------------------------
+  /analysis:
+    get:
+      tags: [analysis]
+      summary: 分析报告列表
+      operationId: listAnalysis
+      parameters:
+        - { $ref: "#/components/parameters/Page" }
+        - { $ref: "#/components/parameters/PageSize" }
+        - name: agent_type
+          in: query
+          schema: { $ref: "#/components/schemas/AgentType" }
+        - name: band
+          in: query
+          schema: { $ref: "#/components/schemas/ScoreBand" }
+        - name: start
+          in: query
+          schema: { type: string, format: date-time }
+        - name: end
+          in: query
+          schema: { type: string, format: date-time }
+        - name: min_score
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 10 }
+        - name: code
+          in: query
+          description: 按关联标的过滤
+          schema: { type: string }
+        - name: status
+          in: query
+          schema: { type: string, enum: [PUBLISHED, DEGRADED], default: PUBLISHED }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/PageMeta"
+                  - type: object
+                    properties:
+                      items:
+                        type: array
+                        items: { $ref: "#/components/schemas/AnalysisReport" }
+
+  /analysis/{report_id}:
+    get:
+      tags: [analysis]
+      summary: 分析报告详情（含结构化正文）
+      operationId: getAnalysis
+      parameters:
+        - name: report_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AnalysisReportDetail" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  # ----------------------------- MARKET -----------------------------
+  /market/overview:
+    get:
+      tags: [market]
+      summary: 市场概览（指数/涨跌家数/成交额/板块 TOP）
+      operationId: getMarketOverview
+      parameters: [{ $ref: "#/components/parameters/TradeDate" }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MarketOverview" }
+
+  /market/pre-market:
+    get:
+      tags: [market]
+      summary: 盘前展望简报
+      operationId: getPreMarketBrief
+      parameters: [{ $ref: "#/components/parameters/TradeDate" }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PreMarketBrief" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /market/post-market:
+    get:
+      tags: [market]
+      summary: 盘后复盘简报（含涨跌归因）
+      operationId: getPostMarketBrief
+      parameters: [{ $ref: "#/components/parameters/TradeDate" }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PostMarketBrief" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /market/briefs:
+    get:
+      tags: [market]
+      summary: 最近 N 天的盘前/盘后简报列表（日历视图）
+      operationId: listBriefs
+      parameters:
+        - { name: days, in: query, schema: { type: integer, default: 30, maximum: 180 } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/BriefMeta" }
+
+  /market/calendar:
+    get:
+      tags: [market]
+      summary: 交易日历
+      operationId: getCalendar
+      parameters:
+        - { name: start, in: query, required: true, schema: { type: string, format: date } }
+        - { name: end, in: query, required: true, schema: { type: string, format: date } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    date: { type: string, format: date }
+                    is_open: { type: boolean }
+
+  # ----------------------------- SEARCH -----------------------------
+  /search:
+    post:
+      tags: [search]
+      summary: 语义检索（向量 + 关键词混合）
+      operationId: semanticSearch
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [query]
+              properties:
+                query: { type: string, minLength: 2, maxLength: 500 }
+                top_k: { type: integer, default: 20, maximum: 100 }
+                start: { type: string, format: date-time }
+                end: { type: string, format: date-time }
+                band: { type: array, items: { $ref: "#/components/schemas/ScoreBand" } }
+                min_score: { type: integer, minimum: 1, maximum: 10 }
+                codes: { type: array, items: { type: string } }
+                mode: { type: string, enum: [hybrid, vector, keyword], default: hybrid }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/SearchHit" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+  # ----------------------------- STOCKS -----------------------------
+  /stocks/{ts_code}:
+    get:
+      tags: [stocks]
+      summary: 个股档案（基础信息 + 最新估值 + 近期行情）
+      operationId: getStock
+      parameters:
+        - name: ts_code
+          in: path
+          required: true
+          schema: { type: string, example: "600519.SH" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StockProfile" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /stocks/{ts_code}/analysis:
+    get:
+      tags: [stocks]
+      summary: 个股相关分析（个股/行业 Agent 的产出）
+      operationId: getStockAnalysis
+      parameters:
+        - name: ts_code
+          in: path
+          required: true
+          schema: { type: string }
+        - { $ref: "#/components/parameters/Page" }
+        - { $ref: "#/components/parameters/PageSize" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/PageMeta"
+                  - type: object
+                    properties:
+                      items:
+                        type: array
+                        items: { $ref: "#/components/schemas/AnalysisReport" }
+
+  /stocks/{ts_code}/news:
+    get:
+      tags: [stocks]
+      summary: 个股相关资讯
+      operationId: getStockNews
+      parameters:
+        - name: ts_code
+          in: path
+          required: true
+          schema: { type: string }
+        - { $ref: "#/components/parameters/Page" }
+        - { $ref: "#/components/parameters/PageSize" }
+        - { name: days, in: query, schema: { type: integer, default: 30 } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/PageMeta"
+                  - type: object
+                    properties:
+                      items:
+                        type: array
+                        items: { $ref: "#/components/schemas/NewsItem" }
+
+  /sectors:
+    get:
+      tags: [stocks]
+      summary: 板块列表及当日表现
+      operationId: listSectors
+      parameters: [{ $ref: "#/components/parameters/TradeDate" }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/SectorQuote" }
+
+  # ------------------------------ CHAT ------------------------------
+  /chat/sessions:
+    get:
+      tags: [chat]
+      summary: 会话列表
+      operationId: listChatSessions
+      parameters:
+        - { $ref: "#/components/parameters/Page" }
+        - { $ref: "#/components/parameters/PageSize" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/PageMeta"
+                  - type: object
+                    properties:
+                      items:
+                        type: array
+                        items: { $ref: "#/components/schemas/ChatSession" }
+    post:
+      tags: [chat]
+      summary: 创建会话
+      operationId: createChatSession
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                title: { type: string }
+                context_filter: { $ref: "#/components/schemas/ContextFilter" }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ChatSession" }
+
+  /chat/sessions/{session_id}:
+    get:
+      tags: [chat]
+      summary: 会话详情
+      operationId: getChatSession
+      parameters: [{ $ref: "#/components/parameters/SessionId" }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ChatSession" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [chat]
+      summary: 删除会话
+      operationId: deleteChatSession
+      parameters: [{ $ref: "#/components/parameters/SessionId" }]
+      responses:
+        "204": { description: No Content }
+
+  /chat/sessions/{session_id}/messages:
+    get:
+      tags: [chat]
+      summary: 会话消息历史
+      operationId: listChatMessages
+      parameters:
+        - { $ref: "#/components/parameters/SessionId" }
+        - { $ref: "#/components/parameters/Page" }
+        - { $ref: "#/components/parameters/PageSize" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/PageMeta"
+                  - type: object
+                    properties:
+                      items:
+                        type: array
+                        items: { $ref: "#/components/schemas/ChatMessage" }
+    post:
+      tags: [chat]
+      summary: 发起追问（SSE 流式返回）
+      operationId: postChatMessage
+      parameters: [{ $ref: "#/components/parameters/SessionId" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [content]
+              properties:
+                content: { type: string, minLength: 1, maxLength: 2000 }
+                stream: { type: boolean, default: true }
+                context_filter: { $ref: "#/components/schemas/ContextFilter" }
+      responses:
+        "200":
+          description: SSE 流（`text/event-stream`）；非流式时返回 application/json
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                description: >
+                  事件类型：`delta`（增量文本）、`references`（引用资讯）、`done`（含 message_id 与 token 统计）、`error`
+            application/json:
+              schema: { $ref: "#/components/schemas/ChatMessage" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "503":
+          description: 分析服务（LLM）不可用
+          content:
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
+
+  # ------------------------------ ADMIN ------------------------------
+  /admin/ingest/backfill:
+    post:
+      tags: [admin]
+      summary: 指定区间补数
+      operationId: backfillIngest
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [start, end]
+              properties:
+                start: { type: string, format: date-time }
+                end: { type: string, format: date-time }
+                source_keys: { type: array, items: { type: string } }
+      responses:
+        "202":
+          description: Accepted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  job_id: { type: string, format: uuid }
+
+  /admin/news/{news_id}/rescore:
+    post:
+      tags: [admin]
+      summary: 重算评分（可指定 prompt 版本）
+      operationId: rescoreNews
+      parameters: [{ $ref: "#/components/parameters/NewsId" }]
+      responses:
+        "202": { description: Accepted }
+
+  /admin/news/{news_id}/reanalyze:
+    post:
+      tags: [admin]
+      summary: 重跑深度分析
+      operationId: reanalyzeNews
+      parameters: [{ $ref: "#/components/parameters/NewsId" }]
+      responses:
+        "202": { description: Accepted }
+
+  /admin/events/backlog:
+    get:
+      tags: [admin]
+      summary: 事件积压与死信统计
+      operationId: getBacklog
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  pending: { type: integer }
+                  overdue: { type: integer }
+                  dead_letter: { type: integer }
+                  by_type:
+                    type: object
+                    additionalProperties: { type: integer }
+
+  /admin/dead-letter/{dl_id}/replay:
+    post:
+      tags: [admin]
+      summary: 重放死信
+      operationId: replayDeadLetter
+      parameters:
+        - name: dl_id
+          in: path
+          required: true
+          schema: { type: integer }
+      responses:
+        "202": { description: Accepted }
+
+components:
+
+  securitySchemes:
+    DeviceAuth:
+      type: apiKey
+      in: header
+      name: X-Device-Id
+      description: MVP 匿名设备标识；后续接入账号体系后改为 Bearer JWT，路径与载荷不变。
+
+  parameters:
+    Page:
+      name: page
+      in: query
+      schema: { type: integer, minimum: 1, default: 1 }
+    PageSize:
+      name: page_size
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+    NewsId:
+      name: news_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid, description: news_item.public_id }
+    SessionId:
+      name: session_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    TradeDate:
+      name: date
+      in: query
+      description: 交易日 YYYY-MM-DD，默认最近交易日
+      schema: { type: string, format: date }
+
+  responses:
+    BadRequest:
+      description: 参数错误
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    NotFound:
+      description: 资源不存在
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    TooManyRequests:
+      description: 触发限流
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+
+  schemas:
+
+    Problem:
+      type: object
+      description: RFC 9457 Problem Details
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string }
+        trace_id: { type: string }
+
+    PageMeta:
+      type: object
+      properties:
+        page: { type: integer }
+        page_size: { type: integer }
+        total: { type: integer }
+        has_more: { type: boolean }
+
+    ScoreBand:
+      type: string
+      enum: [NOISE, STOCK, INDUSTRY, MACRO]
+      description: (0,3] NOISE； (3,5] STOCK； (5,7] INDUSTRY； (7,10] MACRO
+
+    IngestKind:
+      type: string
+      enum: [news, major_news, anns, forecast, top_list, market]
+
+    AgentType:
+      type: string
+      enum: [scoring, macro_policy, industry, stock, pre_market, post_market, qa]
+
+    Entity:
+      type: object
+      properties:
+        type: { type: string, enum: [stock, sector, index, macro] }
+        code: { type: string, example: "600519.SH" }
+        name: { type: string, example: "贵州茅台" }
+        confidence: { type: number, format: float }
+
+    ContextFilter:
+      type: object
+      properties:
+        start: { type: string, format: date-time }
+        end: { type: string, format: date-time }
+        band: { type: array, items: { $ref: "#/components/schemas/ScoreBand" } }
+        codes: { type: array, items: { type: string } }
+
+    NewsItem:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        title: { type: string }
+        summary: { type: string, description: 正文摘要（列表展示用，约 120 字） }
+        source: { type: string, example: "tushare" }
+        src: { type: string, example: "cls" }
+        src_name: { type: string, example: "财联社" }
+        kind: { $ref: "#/components/schemas/IngestKind" }
+        channels: { type: string, nullable: true }
+        publish_time: { type: string, format: date-time }
+        ingested_at: { type: string, format: date-time }
+        score: { type: integer, nullable: true, minimum: 1, maximum: 10 }
+        band: { $ref: "#/components/schemas/ScoreBand" }
+        score_reason: { type: string, nullable: true }
+        tags: { type: array, items: { type: string } }
+        entities: { type: array, items: { $ref: "#/components/schemas/Entity" } }
+        has_analysis: { type: boolean }
+        analysis_summary: { type: string, nullable: true }
+        analysis_id: { type: string, format: uuid, nullable: true }
+        seen_count: { type: integer, description: 同源重复出现次数 }
+
+    NewsDetail:
+      allOf:
+        - $ref: "#/components/schemas/NewsItem"
+        - type: object
+          properties:
+            content: { type: string }
+            content_truncated: { type: boolean }
+            url: { type: string, nullable: true }
+            dedup_of: { type: string, format: uuid, nullable: true }
+            score_history:
+              type: array
+              items:
+                type: object
+                properties:
+                  score: { type: integer }
+                  band: { $ref: "#/components/schemas/ScoreBand" }
+                  reason: { type: string }
+                  model: { type: string }
+                  prompt_version: { type: string }
+                  created_at: { type: string, format: date-time }
+            related_news:
+              type: array
+              items: { $ref: "#/components/schemas/RelatedNews" }
+
+    RelatedNews:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        title: { type: string }
+        publish_time: { type: string, format: date-time }
+        score: { type: integer, nullable: true }
+        similarity: { type: number, format: float }
+
+    AnalysisReport:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        agent_type: { $ref: "#/components/schemas/AgentType" }
+        news_id: { type: string, format: uuid, nullable: true }
+        news_title: { type: string, nullable: true }
+        trade_date: { type: string, format: date, nullable: true }
+        title: { type: string }
+        summary: { type: string }
+        score: { type: integer, nullable: true }
+        band: { $ref: "#/components/schemas/ScoreBand" }
+        sentiment: { type: string, enum: [positive, negative, neutral, mixed] }
+        impact_level: { type: string, enum: [high, medium, low] }
+        horizon: { type: string, enum: [intraday, short, medium, long] }
+        confidence: { type: number, format: float }
+        beneficiaries: { type: array, items: { $ref: "#/components/schemas/ImpactTarget" } }
+        victims: { type: array, items: { $ref: "#/components/schemas/ImpactTarget" } }
+        entities: { type: array, items: { $ref: "#/components/schemas/Entity" } }
+        references: { type: array, items: { type: string, format: uuid } }
+        status: { type: string, enum: [DRAFT, PUBLISHED, DEGRADED, SUPERSEDED] }
+        model: { type: string }
+        prompt_version: { type: string }
+        published_at: { type: string, format: date-time }
+        disclaimer: { type: string }
+
+    AnalysisReportDetail:
+      allOf:
+        - $ref: "#/components/schemas/AnalysisReport"
+        - type: object
+          properties:
+            content:
+              type: object
+              description: 结构化正文，字段随 agent_type 变化（见文档 §4 示例）
+              additionalProperties: true
+            external_sources:
+              type: array
+              items:
+                type: object
+                properties:
+                  title: { type: string }
+                  url: { type: string, format: uri }
+                  publisher: { type: string }
+                  published_at: { type: string, format: date-time }
+            run:
+              type: object
+              properties:
+                run_id: { type: string, format: uuid }
+                latency_ms: { type: integer }
+                prompt_tokens: { type: integer }
+                completion_tokens: { type: integer }
+                attempts: { type: integer }
+
+    ImpactTarget:
+      type: object
+      properties:
+        code: { type: string, example: "BK0447" }
+        name: { type: string, example: "半导体" }
+        type: { type: string, enum: [stock, sector, index] }
+        reason: { type: string }
+        direction: { type: string, enum: [positive, negative] }
+
+    MarketOverview:
+      type: object
+      properties:
+        trade_date: { type: string, format: date }
+        is_trading_day: { type: boolean }
+        updated_at: { type: string, format: date-time }
+        indices:
+          type: array
+          items:
+            type: object
+            properties:
+              code: { type: string, example: "000001.SH" }
+              name: { type: string, example: "上证指数" }
+              close: { type: number, format: double }
+              pct_chg: { type: number, format: double }
+              amount: { type: number, format: double, description: 成交额（亿元） }
+        breadth:
+          type: object
+          properties:
+            advance: { type: integer }
+            decline: { type: integer }
+            flat: { type: integer }
+            limit_up: { type: integer }
+            limit_down: { type: integer }
+            total_amount: { type: number, format: double }
+        sectors_top: { type: array, items: { $ref: "#/components/schemas/SectorQuote" } }
+        sectors_bottom: { type: array, items: { $ref: "#/components/schemas/SectorQuote" } }
+        headline:
+          type: string
+          nullable: true
+          description: 一句话市场状态（来自最新盘后简报）
+
+    SectorQuote:
+      type: object
+      properties:
+        code: { type: string }
+        name: { type: string }
+        pct_chg: { type: number, format: double }
+        turnover: { type: number, format: double, nullable: true }
+        leading_stock:
+          type: object
+          nullable: true
+          properties:
+            code: { type: string }
+            name: { type: string }
+            pct_chg: { type: number, format: double }
+
+    UsQuote:
+      type: object
+      properties:
+        symbol: { type: string, example: ".IXIC" }
+        name: { type: string, example: "纳斯达克" }
+        close: { type: number, format: double }
+        pct_chg: { type: number, format: double }
+        trade_date: { type: string, format: date }
+
+    BriefMeta:
+      type: object
+      properties:
+        trade_date: { type: string, format: date }
+        period: { type: string, enum: [pre_market, post_market] }
+        report_id: { type: string, format: uuid }
+        title: { type: string }
+        summary: { type: string }
+        published_at: { type: string, format: date-time }
+
+    PreMarketBrief:
+      allOf:
+        - $ref: "#/components/schemas/AnalysisReportDetail"
+        - type: object
+          properties:
+            trade_date: { type: string, format: date }
+            us_market: { type: array, items: { $ref: "#/components/schemas/UsQuote" } }
+            overnight_top_news:
+              type: array
+              items:
+                type: object
+                properties:
+                  news_id: { type: string, format: uuid }
+                  title: { type: string }
+                  score: { type: integer }
+                  summary: { type: string }
+            focus_directions:
+              type: array
+              items:
+                type: object
+                properties:
+                  name: { type: string }
+                  reason: { type: string }
+                  codes: { type: array, items: { type: string } }
+
+    PostMarketBrief:
+      allOf:
+        - $ref: "#/components/schemas/AnalysisReportDetail"
+        - type: object
+          properties:
+            trade_date: { type: string, format: date }
+            verdict:
+              type: object
+              description: 今日定调
+              properties:
+                state: { type: string, enum: [up, down, flat, volatile] }
+                one_liner: { type: string, description: "今天为什么涨/跌/平静" }
+            attribution:
+              type: array
+              description: 归因，按贡献度降序
+              items:
+                type: object
+                properties:
+                  factor: { type: string }
+                  direction: { type: string, enum: [positive, negative] }
+                  weight: { type: number, format: double }
+                  news_ids: { type: array, items: { type: string, format: uuid } }
+            market_stats:
+              type: object
+              properties:
+                advance: { type: integer }
+                decline: { type: integer }
+                limit_up: { type: integer }
+                limit_down: { type: integer }
+                total_amount: { type: number, format: double }
+            next_day_focus: { type: array, items: { type: string } }
+
+    SearchHit:
+      type: object
+      properties:
+        news_id: { type: string, format: uuid }
+        chunk_id: { type: integer }
+        title: { type: string }
+        snippet: { type: string }
+        publish_time: { type: string, format: date-time }
+        score: { type: integer, nullable: true }
+        band: { $ref: "#/components/schemas/ScoreBand" }
+        similarity: { type: number, format: float }
+        analysis_id: { type: string, format: uuid, nullable: true }
+
+    StockProfile:
+      type: object
+      properties:
+        ts_code: { type: string, example: "600519.SH" }
+        name: { type: string }
+        industry: { type: string }
+        market: { type: string }
+        latest:
+          type: object
+          properties:
+            trade_date: { type: string, format: date }
+            close: { type: number, format: double }
+            pct_chg: { type: number, format: double }
+            pe_ttm: { type: number, format: double, nullable: true }
+            pb: { type: number, format: double, nullable: true }
+            ps_ttm: { type: number, format: double, nullable: true }
+            total_mv: { type: number, format: double, description: 总市值（万元） }
+            turnover_rate: { type: number, format: double }
+        trend:
+          type: array
+          description: 近 60 日 K 线（简版）
+          items:
+            type: object
+            properties:
+              trade_date: { type: string, format: date }
+              close: { type: number, format: double }
+              pct_chg: { type: number, format: double }
+              vol: { type: number, format: double }
+
+    ChatSession:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        title: { type: string, nullable: true }
+        context_filter: { $ref: "#/components/schemas/ContextFilter" }
+        message_count: { type: integer }
+        created_at: { type: string, format: date-time }
+        last_message_at: { type: string, format: date-time, nullable: true }
+
+    ChatMessage:
+      type: object
+      properties:
+        id: { type: string }
+        session_id: { type: string, format: uuid }
+        role: { type: string, enum: [user, assistant, system] }
+        content: { type: string }
+        references:
+          type: array
+          items:
+            type: object
+            properties:
+              news_id: { type: string, format: uuid }
+              title: { type: string }
+              publish_time: { type: string, format: date-time }
+              score: { type: integer, nullable: true }
+              snippet: { type: string }
+        status: { type: string, enum: [OK, FAILED, ABSTAINED] }
+        model: { type: string, nullable: true }
+        latency_ms: { type: integer, nullable: true }
+        created_at: { type: string, format: date-time }
+        disclaimer: { type: string, nullable: true }
