@@ -9,9 +9,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from langchain_core.embeddings import Embeddings
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_openai import ChatOpenAI
 
 from fin_news.agents.llm.client import LLMUnavailable
 from fin_news.core.config import LLMRole, ProviderName, Settings, get_settings
@@ -28,12 +27,16 @@ _TEMPERATURE: dict[str, float] = {
 
 
 class ModelFactory:
-    """按角色构建带降级的 ChatModel，以及统一的 Embeddings。"""
+    """按角色构建带降级的 ChatModel。
+
+    注意：Embedding 已独立到 `agents/embeddings.py` 的 `Embedder`（直连火山方舟
+    `/embeddings/multimodal` 接口），不再走 OpenAIEmbeddings —— doubao-embedding-vision
+    的接口与 input 格式与 OpenAI 的 /embeddings 不兼容。
+    """
 
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or get_settings()
         self._cache: dict[tuple[str, str], ChatOpenAI] = {}
-        self._embeddings: Embeddings | None = None
 
     # ------------------------------------------------------------------
     def build(self, provider: ProviderName, role: LLMRole) -> ChatOpenAI | None:
@@ -81,26 +84,6 @@ class ModelFactory:
         if temperature is not None:
             model = model.bind(temperature=temperature)
         return model
-
-    # ------------------------------------------------------------------
-    def embeddings(self) -> Embeddings:
-        """统一的 Embeddings 客户端。
-
-        check_embedding_ctx_length=False 是必需的：火山模型名不在 tiktoken 词表，
-        开启长度校验会直接抛错（实测）。
-        """
-        if self._embeddings is None:
-            provider = self.settings.embedding_provider
-            cfg = self.settings.provider(provider)
-            if not cfg.api_key:
-                raise LLMUnavailable(f"embedding provider {provider} 未配置 api_key")
-            self._embeddings = OpenAIEmbeddings(
-                model=self.settings.model_for(provider, "embedding"),
-                base_url=cfg.base_url,
-                api_key=cfg.api_key,
-                check_embedding_ctx_length=False,
-            )
-        return self._embeddings
 
     # ------------------------------------------------------------------
     def structured(

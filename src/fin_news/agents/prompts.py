@@ -124,7 +124,7 @@ ANALYSIS_SCHEMA = {
 
 # ============================== 宏观政策 ==============================
 
-MACRO_VERSION = "macro.v1"
+MACRO_VERSION = "macro.v2"
 
 MACRO_SYSTEM = f"""你是宏观政策与市场策略分析师，服务对象是想搞明白「为什么涨/为什么跌」的个人投资者。
 
@@ -148,23 +148,15 @@ MACRO_USER_TEMPLATE = """## 待分析资讯
 - 正文：
 {content}
 
-## 历史相似资讯（向量检索得到，供参考）
-
-{history}
-
-## 外部检索结果
-
-{external}
-
 ## 当前市场快照
 
 {market}
 
-请输出严格合法的 JSON，结构见 schema。"""
+历史同类事件与外部信息请通过 history_search / web_search 工具自行检索补充。请输出分析结果。"""
 
 # ============================== 行业 ==============================
 
-INDUSTRY_VERSION = "industry.v1"
+INDUSTRY_VERSION = "industry.v2"
 
 INDUSTRY_SYSTEM = f"""你是产业与行业研究员。任务是分析一条行业/产业事件对该行业的影响。
 
@@ -185,7 +177,7 @@ INDUSTRY_USER_TEMPLATE = MACRO_USER_TEMPLATE
 
 # ============================== 个股 ==============================
 
-STOCK_VERSION = "stock.v1"
+STOCK_VERSION = "stock.v2"
 
 STOCK_SYSTEM = f"""你是个股研究员。任务是分析一条个股事件对相关标的的影响。
 

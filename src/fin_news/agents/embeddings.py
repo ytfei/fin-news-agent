@@ -1,12 +1,27 @@
-"""Embedding 客户端：统一走 LangChain Embeddings 接口（火山 / DeepSeek 兼容）。
+"""Embedding 客户端：直连火山方舟多模态向量化接口。
 
-保留自建 Embedder 的原因是业务侧需要：
-* 按 embedding_batch_size 分批（长资讯分块后可能几十块）
+doubao-embedding-vision 与旧文本模型（doubao-embedding-text-240715）的关键差异：
+
+* 接口：`POST {base_url}/embeddings/multimodal`（不是 OpenAI 兼容的 `/embeddings`）
+* input 为**对象数组** `[{"type": "text", "text": "..."}]`，不是字符串数组
+* 维度由请求参数 `dimensions` 指定（1024 或 2048），不再是模型固定值
+* **单样本语义**：一次请求的 input 数组表示「一个多模态样本的若干部分」
+  （文本/图片/视频混合），返回的是这一个样本的**一个**融合向量 —— 响应 `data`
+  字段是对象 `{"embedding": [...]}` 而非 OpenAI 的数组 `[{"embedding": ...}]`。
+  因此无法像 OpenAI 那样一次请求批量文本，必须逐条请求（这里用 asyncio.gather
+  并发逐条，分批限流）。
+
+保留自建 Embedder 的原因：
 * 写入前的维度校验（维度不一致必须终止，否则污染向量索引）
 """
 from __future__ import annotations
 
-from fin_news.agents.llm.factory import get_model_factory
+import asyncio
+from typing import Any
+
+import httpx
+
+from fin_news.agents.llm.client import LLMUnavailable
 from fin_news.core.config import Settings, get_settings
 from fin_news.core.logging import get_logger
 
@@ -20,44 +35,83 @@ class DimensionMismatch(ValueError):
 class Embedder:
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or get_settings()
-        self._embeddings = None
+        self._client: httpx.AsyncClient | None = None
 
+    # ------------------------------------------------------------------
     @property
-    def embeddings(self):
-        """LangChain Embeddings 客户端（懒加载）。
+    def client(self) -> httpx.AsyncClient:
+        """复用 httpx.AsyncClient（embedding 调用频繁，避免每次建连）。"""
+        if self._client is None:
+            self._client = httpx.AsyncClient(timeout=self.settings.llm_timeout_seconds)
+        return self._client
 
-        火山模型名不在 tiktoken 词表，工厂里已关闭 check_embedding_ctx_length。
-        """
-        if self._embeddings is None:
-            self._embeddings = get_model_factory(self.settings).embeddings()
-        return self._embeddings
+    async def close(self) -> None:
+        if self._client is not None:
+            await self._client.aclose()
+            self._client = None
 
+    def _endpoint(self) -> tuple[str, dict[str, str]]:
+        provider = self.settings.embedding_provider
+        cfg = self.settings.provider(provider)
+        if not cfg.api_key:
+            raise LLMUnavailable(f"embedding provider {provider} 未配置 api_key")
+        url = f"{cfg.base_url.rstrip('/')}/embeddings/multimodal"
+        headers = {
+            "Authorization": f"Bearer {cfg.api_key}",
+            "Content-Type": "application/json",
+        }
+        return url, headers
+
+    def _payload(self, text: str) -> dict[str, object]:
+        model = self.settings.model_for(self.settings.embedding_provider, "embedding")
+        return {
+            "model": model,
+            "input": [{"type": "text", "text": text}],
+            "encoding_format": "float",
+            "dimensions": self.settings.embedding_dim,
+            "sparse_embedding": {"type": "disabled"},
+        }
+
+    # ------------------------------------------------------------------
     async def embed(self, texts: list[str]) -> list[list[float]]:
         if not texts:
             return []
-        model = self.settings.model_for(self.settings.embedding_provider, "embedding")  # type: ignore[arg-type]
+        model = self.settings.model_for(self.settings.embedding_provider, "embedding")
         vectors: list[list[float]] = []
         batch_size = max(1, self.settings.embedding_batch_size)
 
+        # 单样本语义：逐条请求，用 gather 分批并发限流
         for i in range(0, len(texts), batch_size):
             batch = [t.replace("\n", " ").strip() or " " for t in texts[i : i + batch_size]]
-            vectors.extend(await self.embeddings.aembed_documents(batch))
+            vectors.extend(await asyncio.gather(*(self._embed_one(t) for t in batch)))
 
         self._validate(vectors)
         logger.debug("embedding 完成", model=model, texts=len(texts), dim=len(vectors[0]) if vectors else 0)
         return vectors
 
+    async def _embed_one(self, text: str) -> list[float]:
+        url, headers = self._endpoint()
+        resp = await self.client.post(url, json=self._payload(text), headers=headers)
+        resp.raise_for_status()
+        return self._parse_response(resp.json())
+
+    @staticmethod
+    def _parse_response(data: dict[str, Any]) -> list[float]:
+        """从响应中提取向量。data 字段是对象 {"embedding": [...]} 而非数组。"""
+        return data["data"]["embedding"]
+
     async def embed_one(self, text: str) -> list[float]:
         vecs = await self.embed([text])
         return vecs[0] if vecs else []
 
+    # ------------------------------------------------------------------
     def _validate(self, vectors: list[list[float]]) -> None:
         expected = self.settings.embedding_dim
         for vec in vectors:
             if len(vec) != expected:
                 raise DimensionMismatch(
                     f"embedding 维度不匹配：期望 {expected}，实际 {len(vec)}。"
-                    "请检查 EMBEDDING_DIM 与所选模型是否一致。"
+                    + "请检查 EMBEDDING_DIM 与请求的 dimensions 参数是否一致（doubao-embedding-vision 支持 1024/2048）。"
                 )
 
 

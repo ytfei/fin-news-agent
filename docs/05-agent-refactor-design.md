@@ -296,7 +296,7 @@ macro_policy_agent (DeepAgents)
 | 5 | 迁移节奏 | 一次性切换 | 双跑灰度（成本翻倍但可对比） | **B**：至少 P2/P3 阶段双跑 100 条对比，避免"换了但不知道变好还是变差" |
 | 6 | 盘前/盘后实现 | LangGraph 确定性 DAG | DeepAgents 自治 | **A**：简报要求可复现、步骤固定；把"归因"做成 DAG 里的一个 DeepAgents 子图 |
 
-## 8. 实施进展（P1 / P2 已完成，2026-09-01）
+## 8. 实施进展（P1 / P2 / P3 已完成，2026-09-01）
 
 ### 8.1 已落地
 
@@ -345,6 +345,65 @@ RUN2: [2,6,7,6,5,5,4,5,5,6,2,5,5,4,5,2,2,2,2,2]   distinct=5
 | P3 分析 Agent | 优先做：`json_schema` 已验证可用，分析侧同样受益 |
 | 评分稳定性 | 新增候选方案：同一批跑 2 次取中位数 / 降低 batch_size 到 10–15（减少注意力衰减） |
 | P6 评估集 | **提前到 P3 之前**，先有 100 条人工标注，否则后续优化无法量化 |
+
+### 8.5 P3 分析 Agent 已落地（DeepAgents 化）
+
+| 项 | 内容 |
+| --- | --- |
+| 结构化输出 | `schemas.py` 新增 `AnalysisPayload` / `EntityItemModel`（Pydantic），`headline/summary/bullets/logic_chain/beneficiaries/victims/confidence/sentiment/impact_level/horizon` 原生 schema 保证；`extras` 保持 dict（JSONB 契约不变） |
+| 图缓存 | `graphs/analysis_graphs.py`：`build_analysis_graph` + `get_analysis_graph` 按 (agent_type, version, provider, model) 缓存，不再每条资讯重建 |
+| 子 agent | 宏观 Agent 挂 3 个子 agent（history-analyst / transmission-analyst / external-analyst），web_search 未启用时自动省略 external-analyst |
+| 按 provider 选策略 | `_response_format_for`：火山→`ProviderStrategy`(json_schema)，DeepSeek→`ToolStrategy`(function_calling) |
+| 去掉预取重复 | `_build_context` 不再预取历史/外部信息（交给 Agent 工具），只保留廉价的市场快照；`MACRO/INDUSTRY/STOCK` prompt 版本 bump 到 `v2` |
+| 降级 | `_run_analysis`：DeepAgents 图失败 → `_run_plain_agent`（legacy 单次结构化调用，带主备降级） |
+| 注册表 | `registry.py` 补齐 MACRO_POLICY / INDUSTRY / STOCK 声明，`get_agent` 对 deepagents 委托 `get_analysis_graph` |
+| 测试 | 124 passed（新增 `test_analysis_graphs.py` 13 项） |
+
+**关键集成坑（已解决）**：
+
+1. **`with_fallbacks()` 不兼容 DeepAgents**：`ModelFactory.chat()` 默认返回 `RunnableWithFallbacks`，而 `deepagents.resolve_model` 只认 `BaseChatModel` / `str`，会误当字符串去 `spec.count(":")` 抛 `AttributeError`。→ 分析图内改用 `with_fallback=False`（纯 `ChatOpenAI`），主备降级改由「整图失败降级 legacy」承担。
+2. **DeepSeek 不支持 `response_format=json_schema`**：返回 400 `This response_format type is unavailable now`。→ 按 provider 选择策略，DeepSeek 走 `ToolStrategy`(function_calling)，实测可正确产出 `AnalysisPayload`。
+
+**实测（真实数据）**：
+
+| 项 | 结果 |
+| --- | --- |
+| 图构建 | ✅ 火山 / DeepSeek 均可构建（宏观含 3 子 agent） |
+| DeepSeek + function_calling → `AnalysisPayload` | ✅ 直接产出结构化结果（headline/summary/sentiment/impact 正确） |
+| 报告落库 | ✅ 个股 / 行业 / 宏观均产出完整报告（bullets / logic_chain / beneficiaries / extras） |
+| 降级链路 | ✅ 火山欠费 → DeepAgents 失败 → legacy 自动切 DeepSeek 成功（`DEGRADED` 标注） |
+
+**环境提示**：验证期间火山引擎 `AccountOverdueError`（403，欠费），chat 与 embedding 均不可用；依赖火山 embedding 的 `history_search` 工具会失败并触发整图降级。DeepSeek 侧 chat 正常（无 embedding 服务）。
+
+### 8.6 Embedding 切换到 doubao-embedding-vision（多模态向量化接口）
+
+旧模型 `doubao-embedding-text-240715`（固定 2560 维）切换为 `doubao-embedding-vision`，接口与输入格式**不兼容 OpenAIEmbeddings**，因此重写：
+
+| 项 | 旧（文本模型） | 新（vision 多模态） |
+| --- | --- | --- |
+| 接口 | `POST /embeddings`（OpenAI 兼容） | `POST {base_url}/embeddings/multimodal` |
+| input 格式 | 字符串数组 `["a","b"]` | 对象数组 `[{"type":"text","text":"a"}]` |
+| 响应 data | 数组 `[{"embedding":...}]` | **对象** `{"embedding":[...]}`（单样本语义） |
+| 批量 | 一次请求 N 条文本 → N 个向量 | 一次请求 = 一个样本 = **一个向量**（需逐条请求） |
+| 维度 | 模型固定 2560 维 | 请求参数 `dimensions` 决定（1024 / 2048） |
+| 客户端 | `langchain_openai.OpenAIEmbeddings` | 自建 `Embedder`（httpx 直连） |
+| 列类型 | `halfvec(2560)` | `halfvec(2048)`（迁移 0004，清空旧向量） |
+
+**关键坑（实测踩过）**：火山 multimodal 接口是**单样本语义**——`input` 数组表示「一个多模态样本的若干部分」（文本/图片/视频混合），返回的是这一个样本的**一个**融合向量，`data` 字段是对象而非数组。所以：
+1. 不能像 OpenAI 那样一次请求批量文本（多条文本会被当成一个样本的多个部分，融合成一个向量）；
+2. 正确做法是逐条请求，`Embedder.embed()` 用 `asyncio.gather` 分批并发限流（`embedding_batch_size` 作为并发批大小）。
+
+改动：
+- `agents/embeddings.py` 重写：`Embedder` 直连 `/embeddings/multimodal`，请求带 `encoding_format=float` + `dimensions` + `sparse_embedding=disabled`，逐条请求 + 并发
+- `llm/factory.py` 移除 `OpenAIEmbeddings` 与 `embeddings()`（接口不再适用）
+- `config.py` 默认 `embedding_dim=2048`、`volcengine_model_embedding=doubao-embedding-vision`
+- `.env`：`EMBEDDING_DIM=2048`
+- 迁移 `0004`：`halfvec(2560) → halfvec(2048)`，旧向量清空后由 `sweep` 打回重新向量化
+- `cli.py` `_probe_embedding_dim` 简化（vision 返回维度 == 请求维度，不再需要真实探测）
+
+测试：129 passed（新增 `test_embedding.py` 6 项，验证 multimodal 路径 / 对象数组 input / data 对象解析 / dimensions / 维度校验）。selftest 全绿：`dim=2048`、`halfvec(2048)`、`halfvec_cosine_ops`、写入+检索探针相似度 1.0。
+
+**注意**：`.env` 当前 `VOLCENGINE_BASE_URL=https://ark.cn-beijing.volces.com/api/plan/v3`（Agent Plan），embedding 接口为 `/api/plan/v3/embeddings/multimodal`；Agent Plan 需要专属 API Key。
 
 ## 9. 交付物清单（P1–P5）
 

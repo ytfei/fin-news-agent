@@ -41,3 +41,41 @@ class ScoreBatchModel(_Base):
     """批量评分结果。"""
 
     items: list[ScoreItemModel] = Field(default_factory=list)
+
+
+# ------------------------------ 分析输出 ------------------------------
+
+
+class EntityItemModel(_Base):
+    """受益 / 受损标的（beneficiaries / victims 的元素）。
+
+    方向不放在模型里：beneficiaries 一律 positive、victims 一律 negative，
+    由所在列表决定（与落库时 `_extract_entities` 的约定一致）。
+    """
+
+    code: str | None = None
+    name: str | None = None
+    type: Literal["stock", "sector", "index"] = "sector"
+    reason: str = ""
+
+
+class AnalysisPayload(_Base):
+    """深度分析报告的通用结构化输出。
+
+    headline / summary 等核心字段都有原生 schema 保证，不再靠正则从文本里捞 JSON；
+    extras 保持 dict（各 Agent 特有的自由结构字段，存 JSONB 的 API 契约不变）。
+    """
+
+    headline: str = ""
+    summary: str = ""
+    bullets: list[str] = Field(default_factory=list)
+    logic_chain: list[str] = Field(default_factory=list)
+    beneficiaries: list[EntityItemModel] = Field(default_factory=list)
+    victims: list[EntityItemModel] = Field(default_factory=list)
+    watch_list: list[str] = Field(default_factory=list)
+    risks: list[str] = Field(default_factory=list)
+    confidence: float = Field(default=0.6, ge=0, le=1)
+    sentiment: Literal["positive", "negative", "neutral", "mixed"] = "neutral"
+    impact_level: Literal["high", "medium", "low"] = "medium"
+    horizon: Literal["intraday", "short", "medium", "long"] = "short"
+    extras: dict[str, object] = Field(default_factory=dict)

@@ -444,16 +444,13 @@ async def _selftest_embedding(settings: Settings) -> bool:
 
 
 async def _probe_embedding_dim(embedder: Embedder) -> int | None:
-    """绕过维度校验，取模型真实输出维度（用于报错时给出正确的 EMBEDDING_DIM 取值）。"""
-    try:
-        settings = embedder.settings
-        resp = await embedder.client.embeddings.create(
-            model=settings.model_for(settings.embedding_provider, "embedding"),
-            input=["维度探测"],
-        )
-        return len(resp.data[0].embedding)
-    except Exception:  # noqa: BLE001
-        return None
+    """取模型真实输出维度（用于报错时给出正确的 EMBEDDING_DIM 取值）。
+
+    doubao-embedding-vision 的向量维度由请求参数 `dimensions` 决定（1024/2048），
+    返回维度恒等于请求维度，因此直接返回配置值即可——不再像旧文本模型那样
+    （doubao-embedding-text-240715 固定 2560 维）需要真实调用探测。
+    """
+    return embedder.settings.embedding_dim
 
 
 async def _check_vector_column(vec: list[float]) -> bool:  # noqa: C901

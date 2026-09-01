@@ -49,9 +49,34 @@ AGENT_SPECS: dict[AgentType, AgentSpec] = {
         recursion_limit=1 + 3 * 2,  # call/validate/rescue 最多循环 2 轮
         note="批量评分：高频低延迟，用显式图而不是自主 Agent",
     ),
-    # 后续阶段补齐：
-    # AgentType.MACRO_POLICY / INDUSTRY → deepagents
-    # AgentType.STOCK / PRE_MARKET / POST_MARKET / QA → langgraph
+    AgentType.MACRO_POLICY: AgentSpec(
+        agent_type=AgentType.MACRO_POLICY,
+        framework="deepagents",
+        model_role="analysis",
+        prompt_version="macro.v2",
+        recursion_limit=12,
+        timeout_seconds=300,
+        note="宏观/政策：DeepAgents + 子 agent（历史 / 传导 / 外部并行）",
+    ),
+    AgentType.INDUSTRY: AgentSpec(
+        agent_type=AgentType.INDUSTRY,
+        framework="deepagents",
+        model_role="analysis",
+        prompt_version="industry.v2",
+        recursion_limit=12,
+        timeout_seconds=300,
+        note="行业/产业：DeepAgents 自主检索 + 估值分析",
+    ),
+    AgentType.STOCK: AgentSpec(
+        agent_type=AgentType.STOCK,
+        framework="deepagents",
+        model_role="analysis",
+        prompt_version="stock.v2",
+        recursion_limit=12,
+        timeout_seconds=300,
+        note="个股事件：DeepAgents 精简版（估值 + 走势）",
+    ),
+    # 后续阶段补齐：PRE_MARKET / POST_MARKET → langgraph DAG；QA → langgraph RAG
 }
 
 _BUILDERS: dict[str, Builder] = {}
@@ -65,10 +90,19 @@ _graphs: dict[tuple[AgentType, str], Any] = {}
 
 
 def get_agent(agent_type: AgentType, settings: Any | None = None) -> Any:
-    """按需构建并缓存 Agent 图（键 = agent_type + prompt_version）。"""
+    """按需构建并缓存 Agent 图（键 = agent_type + prompt_version）。
+
+    deepagents 框架委托给 analysis_graphs.get_analysis_graph（内部按
+    agent_type + version + provider + model 缓存），避免两套缓存。
+    """
     spec = AGENT_SPECS.get(agent_type)
     if spec is None or not spec.enabled:
         raise KeyError(f"未注册或未启用的 Agent：{agent_type}")
+
+    if spec.framework == "deepagents":
+        from fin_news.agents.graphs.analysis_graphs import get_analysis_graph
+
+        return get_analysis_graph(agent_type, settings)
 
     key = (agent_type, spec.prompt_version)
     if key not in _graphs:
@@ -84,3 +118,6 @@ def get_agent(agent_type: AgentType, settings: Any | None = None) -> Any:
 def clear_cache() -> None:
     """清空图缓存（配置变更 / 测试用）。"""
     _graphs.clear()
+    from fin_news.agents.graphs.analysis_graphs import clear_cache as _clear_analysis
+
+    _clear_analysis()

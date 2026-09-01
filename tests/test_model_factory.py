@@ -74,14 +74,7 @@ def test_structured_raises_without_credentials():
         )
 
 
-def test_embeddings_requires_api_key():
-    with pytest.raises(LLMUnavailable):
-        ModelFactory(_settings(volcengine_api_key="")).embeddings()
-
-
-def test_embeddings_client_built_and_cached():
-    factory = ModelFactory(_settings())
-    emb = factory.embeddings()
-    assert emb is factory.embeddings()
-    # 火山模型名不在 tiktoken 词表，必须关闭长度校验
-    assert emb.check_embedding_ctx_length is False
+def test_factory_no_longer_exposes_embeddings():
+    # embedding 已独立到 agents/embeddings.py 的 Embedder（直连 /embeddings/multimodal），
+    # ModelFactory 不再提供 OpenAIEmbeddings（其接口与 doubao-embedding-vision 不兼容）
+    assert not hasattr(ModelFactory(_settings()), "embeddings")

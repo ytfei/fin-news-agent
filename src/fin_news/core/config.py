@@ -113,8 +113,10 @@ class Settings(BaseSettings):
     score_threshold_vectorize: int = 3
 
     # ---------------- Embedding ----------------
+    # doubao-embedding-vision 多模态向量化：维度由请求参数 dimensions 指定，
+    # 可选 1024 / 2048（旧文本模型 doubao-embedding-text-240715 固定 2560 维，已弃用）
     embedding_provider: ProviderName = "volcengine"
-    embedding_dim: int = 1024
+    embedding_dim: int = 2048
     embedding_batch_size: int = 32
 
     # ---------------- LLM ----------------
@@ -128,7 +130,7 @@ class Settings(BaseSettings):
     volcengine_model_scoring: str = "doubao-lite-32k"
     volcengine_model_analysis: str = "doubao-pro-32k"
     volcengine_model_qa: str = "doubao-pro-32k"
-    volcengine_model_embedding: str = "doubao-embedding"
+    volcengine_model_embedding: str = "doubao-embedding-vision"
 
     deepseek_base_url: str = "https://api.deepseek.com"
     deepseek_api_key: str = ""

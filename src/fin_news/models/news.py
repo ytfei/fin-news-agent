@@ -25,8 +25,9 @@ from fin_news.models.base import Base, PublicIdMixin, TimestampMixin, fk, pg_enu
 
 VECTOR_DIM = get_settings().embedding_dim
 
-# 火山 doubao-embedding-text-240715 固定输出 2560 维，超过 HNSW 的 2000 维上限，
-# 因此列类型用 halfvec（HNSW 支持 halfvec 到 4000 维，且存储减半）。
+# doubao-embedding-vision 维度由请求参数 dimensions 决定（1024/2048），
+# 采用 2048 维仍超过 HNSW 对 float vector 的 2000 维上限，因此列类型用 halfvec
+# （HNSW 支持 halfvec 到 4000 维，且存储减半）。
 VECTOR_TYPE = HALFVEC
 
 score_band_t = pg_enum(ScoreBand, "score_band")
