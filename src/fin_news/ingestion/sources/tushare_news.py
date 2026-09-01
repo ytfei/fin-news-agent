@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import time
 from datetime import datetime, timedelta
 
 from fin_news.core.config import Settings, get_settings
@@ -60,7 +61,17 @@ class TushareNewsSource(NewsSource):
         seen: set[str] = set()
 
         for start, end in windows:
-            records = await self._fetch_window(start, end)
+            try:
+                records = await self._fetch_window(start, end)
+            except Exception as exc:  # noqa: BLE001 - 记录失败窗口后继续抛出，位点不前进
+                logger.error(
+                    "拉取窗口失败",
+                    src=self.meta.src,
+                    start=start.strftime("%Y-%m-%d %H:%M:%S"),
+                    end=end.strftime("%Y-%m-%d %H:%M:%S"),
+                    error=str(exc)[:300],
+                )
+                raise
             for rec in records:
                 publish_time = parse_news_datetime(rec.get("datetime"))
                 if publish_time is None:
@@ -98,8 +109,18 @@ class TushareNewsSource(NewsSource):
             "start_date": start.strftime("%Y-%m-%d %H:%M:%S"),
             "end_date": end.strftime("%Y-%m-%d %H:%M:%S"),
         }
+        started = time.perf_counter()
         df = await self.client.query(self.meta.api_name, **kwargs)
-        return TushareClient.to_records(df)
+        records = TushareClient.to_records(df)
+        logger.debug(
+            "拉取窗口完成",
+            src=self.meta.src,
+            start=start.strftime("%Y-%m-%d %H:%M:%S"),
+            end=end.strftime("%Y-%m-%d %H:%M:%S"),
+            records=len(records),
+            elapsed_ms=int((time.perf_counter() - started) * 1000),
+        )
+        return records
 
     def _split_windows(self, since: datetime, until: datetime) -> list[tuple[datetime, datetime]]:
         """按 6 小时切片，降低单次请求压力并规避单次限量。"""

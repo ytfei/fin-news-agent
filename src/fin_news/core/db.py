@@ -1,7 +1,7 @@
 """数据库引擎与会话管理（SQLAlchemy 2.0 async + asyncpg）。"""
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import asynccontextmanager
 
 from sqlalchemy import text
@@ -61,7 +61,7 @@ async def get_session() -> AsyncIterator[AsyncSession]:
 
 
 @asynccontextmanager
-async def session_scope() -> AsyncIterator[AsyncSession]:
+async def session_scope() -> AsyncGenerator[AsyncSession, None]:
     """脚本 / worker 用：退出时自动提交或回滚。"""
     factory = get_session_factory()
     async with factory() as session:

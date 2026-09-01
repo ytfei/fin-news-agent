@@ -6,7 +6,14 @@ from typing import Any
 
 import pandas as pd
 import tushare as ts
-from tenacity import RetryError, retry, retry_if_exception_type, stop_after_attempt, wait_exponential
+from tenacity import (
+    RetryCallState,
+    RetryError,
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 from fin_news.core.config import Settings, get_settings
 from fin_news.core.logging import get_logger
@@ -97,11 +104,21 @@ class TushareClient:
                     self.disable_api(api_name, str(err))
                 raise err from exc
 
+        def _before_sleep(retry_state: RetryCallState) -> None:
+            exc = retry_state.outcome.exception() if retry_state.outcome else None
+            logger.warning(
+                "Tushare 调用重试",
+                api=api_name,
+                attempt=retry_state.attempt_number,
+                error=str(exc)[:200] if exc else "",
+            )
+
         try:
             return await retry(
                 retry=retry_if_exception_type((TushareRateLimitError, TushareConnectionError)),
                 stop=stop_after_attempt(3),
                 wait=wait_exponential(multiplier=1, min=2, max=30),
+                before_sleep=_before_sleep,
                 reraise=True,
             )(_attempt)()
         except RetryError as exc:  # pragma: no cover

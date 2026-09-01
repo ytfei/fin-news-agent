@@ -35,7 +35,7 @@ async def _cmd_ingest() -> int:
     for r in results:
         print(
             f"[{r.status:8}] {r.source_key}: fetched={r.fetched} "
-            f"inserted={r.inserted} duplicates={r.duplicates} filtered={r.filtered}"
+            + f"inserted={r.inserted} duplicates={r.duplicates} filtered={r.filtered}"
         )
     return 0
 
@@ -100,7 +100,7 @@ async def _cmd_status() -> int:
         for c in rows:
             print(
                 f"  位点 {c.source_key}: {c.cursor_time} 状态={c.last_status} "
-                f"上次条数={c.last_count} enabled={c.enabled}"
+                + f"上次条数={c.last_count} enabled={c.enabled}"
             )
     return 0
 
@@ -193,16 +193,18 @@ async def _selftest_llm(settings: Settings) -> bool:
             ok = False
         print(
             f"  [{flag}] {role}: provider={resp.provider} model={resp.model}"
-            f"{' (降级到备 provider)' if resp.is_fallback else ''}"
-            f" 延迟={resp.latency_ms}ms tokens={resp.prompt_tokens}+{resp.completion_tokens}"
-            f" 结构化输出={'正常' if structured else '解析失败 -> ' + (resp.content or '')[:60]}"
+            + (" (降级到备 provider)" if resp.is_fallback else "")
+            + f" 延迟={resp.latency_ms}ms tokens={resp.prompt_tokens}+{resp.completion_tokens}"
+            + f" 结构化输出={'正常' if structured else '解析失败 -> ' + (resp.content or '')[:60]}"
         )
 
     if degraded_roles:
         # 主 provider 模型不可用（常见原因：模型名不存在 / 无权限），全链路都在走备 provider
+        roles = ", ".join(degraded_roles)
+        provider_name = settings.llm_default_provider
         print(
-            f"  [WARN] {', '.join(degraded_roles)} 走了备 provider，"
-            f"请检查 {settings.llm_default_provider} 的模型名是否为账号下真实存在的模型 ID"
+            f"  [WARN] {roles} 走了备 provider，"
+            + f"请检查 {provider_name} 的模型名是否为账号下真实存在的模型 ID"
         )
     return ok
 
@@ -281,7 +283,7 @@ async def _check_vector_column(vec: list[float]) -> bool:  # noqa: C901
             await session.execute(
                 text(
                     "SELECT format_type(a.atttypid, a.atttypmod) FROM pg_attribute a "
-                    "WHERE a.attrelid = 'news_chunk'::regclass AND a.attname = 'embedding' AND a.attnum > 0"
+                    + "WHERE a.attrelid = 'news_chunk'::regclass AND a.attname = 'embedding' AND a.attnum > 0"
                 )
             )
         ).scalar()
@@ -307,14 +309,14 @@ async def _check_vector_column(vec: list[float]) -> bool:  # noqa: C901
         ok = False
         print(
             f"  [FAIL] 列维度 {col_dim} != 模型输出 {actual_dim}："
-            f"需改列类型并重建索引（EMBEDDING_DIM={actual_dim}）"
+            + f"需改列类型并重建索引（EMBEDDING_DIM={actual_dim}）"
         )
     # pgvector 索引上限：float vector 最多 2000 维，halfvec 可到 4000 维
     if type_name == "vector" and actual_dim > 2000:
         ok = False
         print(
             f"  [FAIL] {actual_dim} 维超过 float vector 的索引上限（2000）："
-            f"列类型需改为 halfvec({actual_dim})，索引算子改为 halfvec_cosine_ops"
+            + f"列类型需改为 halfvec({actual_dim})，索引算子改为 halfvec_cosine_ops"
         )
     if indexdef:
         expect_ops = f"{type_name}_cosine_ops"
@@ -341,8 +343,8 @@ async def _check_vector_column(vec: list[float]) -> bool:  # noqa: C901
             await session.execute(
                 text(
                     "INSERT INTO news_chunk (news_id, chunk_index, content, embedding, model) "
-                    f"VALUES (:news_id, 999999, 'selftest-probe', CAST(:vec AS {type_name}), 'selftest') "
-                    "ON CONFLICT (news_id, chunk_index) DO NOTHING"
+                    + f"VALUES (:news_id, 999999, 'selftest-probe', CAST(:vec AS {type_name}), 'selftest') "
+                    + "ON CONFLICT (news_id, chunk_index) DO NOTHING"
                 ),
                 {"news_id": news_id, "vec": literal},
             )
@@ -350,7 +352,7 @@ async def _check_vector_column(vec: list[float]) -> bool:  # noqa: C901
                 await session.execute(
                     text(
                         "SELECT 1 - (embedding <=> CAST(:vec AS " + type_name + ")) "
-                        "FROM news_chunk WHERE chunk_index = 999999 AND model = 'selftest'"
+                        + "FROM news_chunk WHERE chunk_index = 999999 AND model = 'selftest'"
                     ),
                     {"vec": literal},
                 )
@@ -359,7 +361,7 @@ async def _check_vector_column(vec: list[float]) -> bool:  # noqa: C901
             probe_ok = abs(sim_f - 1.0) < 1e-3
             print(
                 f"  [{'OK' if probe_ok else 'FAIL'}] 写入+检索探针：自身相似度={sim_f:.4f}"
-                f"（预期 1.0，事务已回滚）"
+                + "（预期 1.0，事务已回滚）"
             )
             if not probe_ok:
                 ok = False

@@ -1,6 +1,7 @@
 """接入编排：一次增量任务 = 取位点 → 拉取 → 归一化 → 过滤 → 去重 → 落库 → 发事件 → 前进位点。"""
 from __future__ import annotations
 
+import time
 from datetime import datetime, timedelta
 
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -28,6 +29,11 @@ logger = get_logger("ingestion.service")
 MAX_WINDOW = timedelta(hours=24)
 
 
+def _elapsed_ms(started: float) -> int:
+    """耗时（毫秒），用于观察各环节性能。"""
+    return int((time.perf_counter() - started) * 1000)
+
+
 class IngestionService:
     def __init__(
         self,
@@ -41,6 +47,13 @@ class IngestionService:
 
     # ------------------------------------------------------------------
     async def run_all(self) -> list[IngestResult]:
+        started = time.perf_counter()
+        logger.info(
+            "增量接入开始",
+            sources=[s.source_key for s in self.sources],
+            lookback_hours=self.settings.ingest_first_lookback_hours,
+            overlap_seconds=self.settings.ingest_overlap_seconds,
+        )
         results: list[IngestResult] = []
         for source in self.sources:
             try:
@@ -52,10 +65,21 @@ class IngestionService:
                         source_key=source.source_key, status="FAILED", message=str(exc)[:500]
                     )
                 )
+        logger.info(
+            "增量接入结束",
+            sources=len(results),
+            fetched=sum(r.fetched for r in results),
+            inserted=sum(r.inserted for r in results),
+            duplicates=sum(r.duplicates for r in results),
+            filtered=sum(r.filtered for r in results),
+            not_ok=[r.source_key for r in results if r.status != "OK"],
+            elapsed_ms=_elapsed_ms(started),
+        )
         return results
 
     async def run_source(self, source: NewsSource) -> IngestResult:
         ran_at = now()
+        started = time.perf_counter()
         async with session_scope() as session:
             cursors = CursorManager(session)
             default_time = ran_at - timedelta(hours=self.settings.ingest_first_lookback_hours)
@@ -67,24 +91,58 @@ class IngestionService:
             )
             if not cursor.enabled:
                 await cursors.mark_skipped(cursor, "数据源已禁用")
+                logger.warning(
+                    "数据源已禁用，跳过",
+                    source_key=source.source_key,
+                    last_error=cursor.last_error,
+                )
                 return IngestResult(source_key=source.source_key, status="SKIPPED", message="数据源已禁用")
 
             since, until = self._window(cursor)
+            prev_cursor = cursor.cursor_time
+            logger.info(
+                "接入开始",
+                source_key=source.source_key,
+                api=source.meta.api_name,
+                cursor=prev_cursor.isoformat(),
+                since=since.isoformat(),
+                until=until.isoformat(),
+                window_minutes=round((until - since).total_seconds() / 60, 1),
+            )
+
+            fetch_started = time.perf_counter()
             try:
                 raw_items = await source.fetch(since, until)
             except TushareError as exc:
                 await cursors.mark_failure(cursor, str(exc), ran_at)
                 if "权限" in str(exc):
                     cursor.enabled = False
+                    logger.error("数据源无权限，已自动禁用", source_key=source.source_key, error=str(exc)[:300])
                 return IngestResult(
                     source_key=source.source_key, status="FAILED", message=str(exc)[:500]
                 )
+            logger.info(
+                "拉取完成",
+                source_key=source.source_key,
+                fetched=len(raw_items),
+                elapsed_ms=_elapsed_ms(fetch_started),
+            )
+            if not raw_items:
+                logger.info("本轮无新数据", source_key=source.source_key, since=since.isoformat())
 
             result = await self._persist(session, source, raw_items, ran_at)
 
             # 只有整轮成功才前进位点
             if result.status == "OK":
                 await cursors.mark_success(cursor, until, result.inserted, ran_at)
+                logger.info(
+                    "位点前进",
+                    source_key=source.source_key,
+                    from_time=prev_cursor.isoformat(),
+                    to_time=until.isoformat(),
+                )
+            logger.info("接入结束", source_key=source.source_key, status=result.status,
+                        elapsed_ms=_elapsed_ms(started))
             return result
 
     # ------------------------------------------------------------------
@@ -105,33 +163,80 @@ class IngestionService:
         raw_items: list,
         ran_at: datetime,
     ) -> IngestResult:
+        started = time.perf_counter()
         result = IngestResult(source_key=source.source_key, fetched=len(raw_items))
 
+        # 1) 归一化（含标题兜底）
         normalized = normalize_batch(
             raw_items, source.source_key, source.meta.src, source.meta.src_name
         )
+        title_derived = sum(1 for i in normalized if i.metadata.get("title_derived"))
+        logger.info(
+            "归一化完成",
+            source_key=source.source_key,
+            count=len(normalized),
+            title_derived=title_derived,
+            elapsed_ms=_elapsed_ms(started),
+        )
 
-        # 规则层噪声过滤
+        # 2) 规则层噪声过滤（按原因分类计数，便于回查规则是否误杀）
         kept = []
+        reasons: dict[str, int] = {}
         for item in normalized:
             reason = filter_reason(item)
             if reason:
                 result.filtered += 1
+                reasons[reason] = reasons.get(reason, 0) + 1
             else:
                 kept.append(item)
+        if result.filtered:
+            logger.info(
+                "规则过滤",
+                source_key=source.source_key,
+                filtered=result.filtered,
+                reasons=reasons,
+                kept=len(kept),
+            )
 
-        # 去重
+        # 3) 去重（分层统计）
         deduper = Deduper(session, self.settings)
-        fresh, duplicates = await deduper.filter_new(kept)
-        result.duplicates = duplicates
+        fresh, stats = await deduper.filter_new(kept)
+        result.duplicates = stats.total
+        logger.info(
+            "去重完成",
+            source_key=source.source_key,
+            candidates=len(kept),
+            new=len(fresh),
+            dup_in_batch=stats.in_batch,
+            dup_exact=stats.exact,
+            dup_near=stats.near,
+        )
 
         if fresh:
+            # 4) 落库（upsert，幂等）
+            insert_started = time.perf_counter()
             inserted = await self._bulk_insert(session, fresh, ran_at)
             result.inserted = len(inserted)
-            # 事件与数据同事务提交，避免「事件先于数据」
+            logger.info(
+                "落库完成",
+                source_key=source.source_key,
+                rows=len(inserted),
+                elapsed_ms=_elapsed_ms(insert_started),
+            )
+
+            # 5) 发事件：与数据同事务提交，避免「事件先于数据」
             bus = EventBus(session, worker_id=self.worker_id)
             for news_id in inserted:
                 await bus.publish(EventType.NEWS_INGESTED, news_id)
+            logger.info(
+                "事件已发布",
+                source_key=source.source_key,
+                # 注意：不能用 event=，structlog 把 event 作为消息本身的保留键
+                event_type=EventType.NEWS_INGESTED.value,
+                count=len(inserted),
+            )
+        else:
+            logger.info("无新增资讯", source_key=source.source_key, candidates=len(kept))
 
         logger.info(
             "接入完成",
@@ -140,6 +245,7 @@ class IngestionService:
             inserted=result.inserted,
             duplicates=result.duplicates,
             filtered=result.filtered,
+            elapsed_ms=_elapsed_ms(started),
         )
         return result
 

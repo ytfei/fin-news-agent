@@ -1,18 +1,29 @@
 """去重：批内去重 + 库内精确去重(content_hash) + 近似去重(simhash 汉明距离)。"""
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import timedelta
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from fin_news.core.config import Settings, get_settings
-from fin_news.core.logging import get_logger
 from fin_news.domain.schemas import NormalizedItem
 from fin_news.domain.textutil import NEAR_DUP_THRESHOLD, hamming_distance
 from fin_news.models.news import NewsItem
 
-logger = get_logger("ingestion.deduper")
+
+@dataclass
+class DedupStats:
+    """去重命中分层统计（用于观察阈值是否合理）。"""
+
+    in_batch: int = 0  # 批内 content_hash 重复
+    exact: int = 0  # 库内 content_hash 精确命中
+    near: int = 0  # simhash 近似命中（转载改写）
+
+    @property
+    def total(self) -> int:
+        return self.in_batch + self.exact + self.near
 
 
 class Deduper:
@@ -20,18 +31,18 @@ class Deduper:
         self.session = session
         self.settings = settings or get_settings()
 
-    async def filter_new(self, items: list[NormalizedItem]) -> tuple[list[NormalizedItem], int]:
-        """返回 (新条目, 重复数量)。"""
+    async def filter_new(self, items: list[NormalizedItem]) -> tuple[list[NormalizedItem], DedupStats]:
+        """返回 (新条目, 分层去重统计)。"""
+        stats = DedupStats()
         if not items:
-            return [], 0
+            return [], stats
 
         # 1) 批内按 content_hash 去重
         batch_new: list[NormalizedItem] = []
         batch_seen: set[str] = set()
-        duplicates = 0
         for item in items:
             if item.content_hash in batch_seen:
-                duplicates += 1
+                stats.in_batch += 1
                 continue
             batch_seen.add(item.content_hash)
             batch_new.append(item)
@@ -46,13 +57,13 @@ class Deduper:
         candidates: list[NormalizedItem] = []
         for item in batch_new:
             if item.content_hash in existing:
-                duplicates += 1
+                stats.exact += 1
                 await self._bump_seen(item.content_hash)
             else:
                 candidates.append(item)
 
         if not candidates:
-            return [], duplicates
+            return [], stats
 
         # 3) 近似去重：与最近窗口内的 simhash 比较
         window_start = min(i.publish_time for i in candidates) - timedelta(hours=24)
@@ -72,14 +83,12 @@ class Deduper:
             dup_of = self._find_near_duplicate(item.simhash, recent_rows)
             if dup_of:
                 await self._bump_seen(dup_of)
-                duplicates += 1
+                stats.near += 1
                 continue
             final.append(item)
             recent_rows.append((item.simhash, item.content_hash))
 
-        if duplicates:
-            logger.info("去重完成", candidates=len(candidates), duplicates=duplicates, kept=len(final))
-        return final, duplicates
+        return final, stats
 
     @staticmethod
     def _find_near_duplicate(
