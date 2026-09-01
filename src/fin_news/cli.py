@@ -66,6 +66,9 @@ async def _cmd_pipeline(once: bool = True) -> int:
     if once:
         await worker.reclaim()
         n = await worker.tick()
+        # 攒批未满的 news.ingested 事件仍在攒批器里（PROCESSING 态），
+        # 单轮模式下必须放回队列，否则会卡到 reclaim 超时
+        await worker.flush()
         logger.info("本轮处理事件", count=n)
         return 0
     logger.info("启动常驻 worker")
