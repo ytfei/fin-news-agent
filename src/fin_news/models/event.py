@@ -148,6 +148,8 @@ class LLMCallLog(Base, TimestampMixin):
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="OK")
     error_message: Mapped[str | None] = mapped_column(Text)
     cost_cent: Mapped[float | None] = mapped_column()
+    # token 是否来自兜底估算（provider 未返回 usage 时为 true，成本数字仅供参考）
+    estimated: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
 
 class DeadLetter(Base, TimestampMixin):

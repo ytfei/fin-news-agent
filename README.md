@@ -30,6 +30,19 @@
 uv run python -m fin_news.cli selftest   # 一条命令验收数据源 / LLM / Embedding / 向量列
 ```
 
+### Agent 层（LangChain / LangGraph / DeepAgents）
+
+| 阶段 | 状态 | 说明 |
+| --- | --- | --- |
+| P1 模型层 | ✅ 完成 | `ModelFactory`（`with_fallbacks` 主备降级）+ 结构化输出 + 审计回调 |
+| P2 评分 Agent | ✅ 完成 | LangGraph 显式图（打分→校验→漏评补打）+ 图缓存 + 退化护栏；`agent_framework` 可切回 legacy |
+| P3 分析 Agent | ⏳ 待做 | DeepAgents + 子 agent 并行 |
+| P4 追问 | ⏳ 待做 | LangGraph RAG + PostgresSaver 多轮 |
+| P5 盘前/盘后 | ⏳ 待做 | LangGraph DAG |
+| P6 评估集 | ⏳ **建议提前** | 实测两次 LLM 调用分档分歧约 45%，必须有人工标注才能量化优化 |
+
+设计文档见 `docs/05-agent-refactor-design.md`（含实测数据与发现）。
+
 > 未配置模型 Key 时，追问接口返回 `503 + "分析服务暂时不可用"`，评分/分析事件会放回队列等待，不会进死信。
 
 ### 已知缺口

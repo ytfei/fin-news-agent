@@ -11,6 +11,8 @@ from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 ProviderName = Literal["volcengine", "deepseek"]
 LLMRole = Literal["scoring", "analysis", "qa", "embedding"]
+# legacy = 自研 llm/client.py 调用层；langgraph = LangGraph / DeepAgents
+AgentFramework = Literal["legacy", "langgraph"]
 
 
 def parse_str_list(value: object) -> list[str]:
@@ -139,6 +141,18 @@ class Settings(BaseSettings):
     use_deep_agents: bool = True
     analysis_concurrency: int = 4
     analysis_timeout_seconds: int = 300
+
+    # 评分 / 分析的实现层：langgraph 走 LangGraph 图 + 原生结构化输出，
+    # legacy 走自研 llm/client.py；langgraph 失败会自动回退 legacy
+    agent_framework: AgentFramework = "langgraph"
+    # 双跑对比：两套实现各跑一次，只记录差异，不影响入库结果（临时灰度用）
+    score_dual_run: bool = False
+    # 退化护栏：批内分数种类过少（模型"偷懒"给同一个分）时重试一次，取更好的结果
+    score_retry_on_degenerate: bool = True
+    # LangGraph checkpointer 的独立 schema，避免污染业务表与 Alembic autogenerate
+    langgraph_schema: str = "langgraph"
+    # LangSmith 项目名（追踪用，未配置 API Key 时自动不生效）
+    langchain_project: str = "fin-news-v5"
 
     web_search_enabled: bool = False
     web_search_base_url: str = ""

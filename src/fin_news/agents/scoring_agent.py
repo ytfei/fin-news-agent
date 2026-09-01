@@ -6,15 +6,15 @@ import uuid
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from fin_news.agents.graphs.scoring_graph import ScoringRun, build_payload, run_scoring
 from fin_news.agents.llm import get_llm_client, get_semaphore
-from fin_news.agents.prompts import SCORING_SCHEMA, SCORING_SYSTEM, SCORING_USER_TEMPLATE, SCORING_VERSION
+from fin_news.agents.prompts import SCORING_SCHEMA, SCORING_SYSTEM, SCORING_VERSION
 from fin_news.core.config import Settings, get_settings
 from fin_news.core.enums import EntityType, NewsStatus
 from fin_news.core.logging import get_logger
 from fin_news.core.timeutil import now_utc
 from fin_news.domain.schemas import ScoreBatchResult, ScoreEntity, ScoreItemResult
 from fin_news.domain.scoring import band_for_score, clamp_score
-from fin_news.domain.textutil import truncate
 from fin_news.models.news import NewsEntity, NewsItem, NewsScore
 
 logger = get_logger("agents.scoring")
@@ -43,14 +43,46 @@ class ScoringAgent:
         return len(items)
 
     async def score_items(self, session: AsyncSession, items: list[NewsItem]) -> dict[int, ScoreItemResult]:
+        """评分入口：按 agent_framework 选择实现，langgraph 失败自动回退 legacy。"""
         if not items:
             return {}
         if not self.settings.has_llm_credentials():
             logger.warning("未配置任何模型 API Key，跳过评分（资讯保持 NEW 状态）")
             return {}
 
-        payload = self._build_payload(items)
-        result = await self._call_with_degradation(payload, expected_ids={i.id for i in items})
+        expected_ids = {i.id for i in items}
+        result: ScoreBatchResult | None = None
+
+        if self.settings.agent_framework == "langgraph":
+            try:
+                run = await run_scoring(items, self.settings)
+            except Exception as exc:  # noqa: BLE001 - 图执行失败（含超时）回退 legacy
+                logger.warning(
+                    "LangGraph 评分失败，回退 legacy 调用", count=len(items), error=str(exc)[:300]
+                )
+                run = None
+
+            if run is not None and run.items:
+                result = self._run_to_batch_result(run)
+                logger.info(
+                    "评分完成（langgraph）",
+                    total=len(items),
+                    scored=len(run.items),
+                    model=run.model,
+                    rounds=run.rounds,
+                    latency_ms=run.latency_ms,
+                    prompt_tokens=run.prompt_tokens,
+                    completion_tokens=run.completion_tokens,
+                )
+                if self.settings.score_dual_run:
+                    await self._compare_with_legacy(items, expected_ids, run)
+            elif run is not None:
+                logger.warning(
+                    "LangGraph 未产出任何评分，回退 legacy", error=run.error, rounds=run.rounds
+                )
+
+        if result is None:
+            result = await self._score_legacy(items, expected_ids)
 
         if not result.items:
             for item in items:
@@ -64,13 +96,81 @@ class ScoringAgent:
         return {r.id: r for r in result.items}
 
     # ------------------------------------------------------------------
+    async def _score_legacy(self, items: list[NewsItem], expected_ids: set[int]) -> ScoreBatchResult:
+        """原实现：单次 JSON 调用 + 容错解析。"""
+        payload = self._build_payload(items)
+        return await self._call_with_degradation(payload, expected_ids=expected_ids)
+
+    def _run_to_batch_result(self, run: ScoringRun) -> ScoreBatchResult:
+        """把图的执行结果转成与 legacy 一致的 ScoreBatchResult。"""
+        items: list[ScoreItemResult] = []
+        for news_id, scored in run.items.items():
+            items.append(
+                ScoreItemResult(
+                    id=news_id,
+                    score=scored.score,
+                    reason=scored.reason,
+                    tags=list(scored.tags),
+                    entities=[
+                        ScoreEntity(
+                            type=EntityType(e.type) if e.type in EntityType._value2member_map_ else EntityType.MACRO,
+                            code=e.code,
+                            name=e.name,
+                            confidence=e.confidence,
+                        )
+                        for e in scored.entities
+                    ],
+                    confidence=scored.confidence,
+                )
+            )
+        return ScoreBatchResult(
+            items=items,
+            model=run.model,
+            prompt_version=SCORING_VERSION,
+            latency_ms=run.latency_ms,
+            prompt_tokens=run.prompt_tokens,
+            completion_tokens=run.completion_tokens,
+            is_suspect=run.is_suspect,
+        )
+
+    async def _compare_with_legacy(
+        self, items: list[NewsItem], expected_ids: set[int], run: ScoringRun
+    ) -> None:
+        """双跑对比：再用 legacy 实现跑一遍，只记录差异，不影响入库结果。"""
+        try:
+            legacy = await self._score_legacy(items, expected_ids)
+        except Exception as exc:  # noqa: BLE001 - 对比失败不影响主流程
+            logger.warning("双跑对比失败", error=str(exc)[:200])
+            return
+
+        legacy_by_id = {r.id: r.score for r in legacy.items}
+        common = set(legacy_by_id) & set(run.items)
+        if not common:
+            logger.warning("评分双跑对比：两版结果无交集", legacy=len(legacy_by_id), langgraph=len(run.items))
+            return
+
+        exact = sum(1 for nid in common if legacy_by_id[nid] == run.items[nid].score)
+        band_same = sum(
+            1
+            for nid in common
+            if band_for_score(legacy_by_id[nid]) == band_for_score(run.items[nid].score)
+        )
+        diff = sum(abs(legacy_by_id[nid] - run.items[nid].score) for nid in common) / len(common)
+
+        logger.info(
+            "评分双跑对比",
+            compared=len(common),
+            exact_rate=round(exact / len(common), 3),
+            band_same_rate=round(band_same / len(common), 3),
+            mean_abs_diff=round(diff, 3),
+            langgraph_model=run.model,
+            langgraph_ms=run.latency_ms,
+            legacy_ms=legacy.latency_ms,
+        )
+
+    # ------------------------------------------------------------------
     def _build_payload(self, items: list[NewsItem]) -> str:
-        lines = []
-        for idx, item in enumerate(items, start=1):
-            content, _ = truncate(item.content or item.title or "", self.settings.scoring_max_content_chars)
-            time_str = item.publish_time.strftime("%Y-%m-%d %H:%M") if item.publish_time else "时间未知"
-            lines.append(f"{idx}. 【{item.src_name or item.src}】{time_str} 标题：{item.title}\n   正文：{content}")
-        return SCORING_USER_TEMPLATE.format(count=len(items), items="\n".join(lines))
+        return build_payload(items, self.settings.scoring_max_content_chars)
 
     async def _call_with_degradation(
         self, payload: str, expected_ids: set[int]
