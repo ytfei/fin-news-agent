@@ -19,10 +19,10 @@
 | 增量接入 `cli ingest` | 首次 119 条入库；重复运行正确判重（duplicates=121/inserted=18） |
 | 事件链路 `cli pipeline` | 攒批 30 条/批；缺模型 Key 时跳过并把事件放回队列，不进死信 |
 | REST API | `/health`、`/news`、`/news/{id}`、`/analysis`、`/market/*`、`/chat/sessions`、`/admin/*` 均正常 |
-| 单元测试 `pytest` | 50 passed |
+| 单元测试 `pytest` | 129 passed |
 | 静态检查 `ruff` | All checks passed |
 | **评分** | 已实跑：火山 `doubao-seed-2-0-mini` 批量打分，30 条/批约 12–45s |
-| **向量化** | 已实跑：`doubao-embedding-text-240715`，2560 维，列类型 `halfvec(2560)` + HNSW |
+| **向量化** | 已实跑：`doubao-embedding-vision`（多模态接口 `/embeddings/multimodal`），2048 维，列类型 `halfvec(2048)` + HNSW |
 | **深度分析** | 已实跑：个股 / 行业 Agent 产出结构化报告（含受益板块、龙头、估值、逻辑链） |
 | **语义检索** | 已验证：同事件跨源相似度 0.92，无关资讯 0.70 |
 
@@ -36,7 +36,7 @@ uv run python -m fin_news.cli selftest   # 一条命令验收数据源 / LLM / E
 | --- | --- | --- |
 | P1 模型层 | ✅ 完成 | `ModelFactory`（`with_fallbacks` 主备降级）+ 结构化输出 + 审计回调 |
 | P2 评分 Agent | ✅ 完成 | LangGraph 显式图（打分→校验→漏评补打）+ 图缓存 + 退化护栏；`agent_framework` 可切回 legacy |
-| P3 分析 Agent | ⏳ 待做 | DeepAgents + 子 agent 并行 |
+| P3 分析 Agent | ✅ 完成 | DeepAgents + 子 agent（宏观：历史/传导/外部并行）+ 图缓存 + Pydantic 结构化输出；prompt 版本 `v2` |
 | P4 追问 | ⏳ 待做 | LangGraph RAG + PostgresSaver 多轮 |
 | P5 盘前/盘后 | ⏳ 待做 | LangGraph DAG |
 | P6 评估集 | ⏳ **建议提前** | 实测两次 LLM 调用分档分歧约 45%，必须有人工标注才能量化优化 |
@@ -135,33 +135,99 @@ uv run python -m fin_news.main
 
 ---
 
-## 二、数据流
+## 二、数据流（数据库视角）
+
+下面从「表」的角度看主干流程：一条资讯从接入到产出分析报告，依次经过哪些阶段、
+每个阶段读写哪些表、事件如何在 `ingest_event` 队列里串联。表结构详见
+[`docs/03-database-schema.md`](./docs/03-database-schema.md)。
+
+### 2.1 核心表一览
+
+| 分组 | 表 | 作用 |
+| --- | --- | --- |
+| 业务主数据 | `news_item` | 资讯主表，一条资讯一行，`status` 状态机贯穿全流程 |
+| | `news_score` | 评分历史（可重算、可审计）；`news_item` 只存当前生效分 |
+| | `news_chunk` | 向量分块（pgvector），检索与分析的历史记忆 |
+| | `news_entity` | 资讯关联的标的/板块（评分时抽取） |
+| | `analysis_report` | 深度分析报告 + 盘前/盘后简报（统一结构） |
+| 事件队列 | `ingest_event` | 库内事件队列（Outbox/Inbox 合一），串联各阶段 |
+| | `dead_letter` | 超过重试次数的事件，转存供人工重放 |
+| 审计 | `llm_call_log` | 每次 LLM/Embedding 调用的成本与耗时审计 |
+| 接入位点 | `ingest_cursor` | 每个数据源的增量拉取位点（cursor + 5min 重叠） |
+| 行情缓存 | `market_daily` / `index_daily_bar` / `us_daily_bar` / `stock_daily` / `stock_daily_basic` / `top_list_bar` / `stock_forecast` / `stock_basic` / `sector` / `sector_member` / `trade_calendar` | 估值与走势分析、盘前/盘后的输入（**当前未同步，表为空**） |
+| 追问 | `chat_session` / `chat_message` | 多轮问答会话 |
+| 预留 | `agent_run` / `ingest_error` / `prompt_template` | 已建模，暂未实际写入 |
+
+### 2.2 主干流程：一条资讯的数据流转
 
 ```
-Tushare news(src=cls/wallstreetcn)
-   │  APScheduler 每 60s 增量拉取（cursor + 5min 重叠窗口）
-   ▼
-归一化 → 规则过滤 → 去重(content_hash + simhash) → news_item(status=NEW)
-   │  发事件 news.ingested（与数据同事务）
-   ▼
-Pipeline worker（FOR UPDATE SKIP LOCKED 消费）
-   │
-   ├─ 批量评分（flash 模型，30 条/批）→ news_score + news_item.score
-   │     score <= 3  → ARCHIVED_NOISE（不向量化、不分析）
-   │     score >  3   → 发事件 news.scored
-   │
-   ├─ 分块 + Embedding → news_chunk(pgvector) → 发事件 news.embedded
-   │
-   └─ 按评分路由深度分析：
-         (7,10]  macro_policy_agent（历史检索 + 外部检索）
-         (5,7]   industry_agent（行业头部 + 估值）
-         (3,5]   stock_agent（个股估值 + 走势）
-         → analysis_report 落库
-
-cron 07:30 盘前 Agent（隔夜美股 + 要闻 + 展望）
-cron 15:30 盘后 Agent（涨跌归因 + 复盘）
-   → analysis_report(trade_date, period)
+                          Tushare API（cls / wallstreetcn）
+                                    │
+  ① 接入 ingestion                 ▼
+  ┌─────────────────────────────────────────────────────────────┐
+  │ 读：ingest_cursor（取位点）                                    │
+  │ 写：news_item(status=NEW)  +  ingest_cursor（推进位点）        │
+  │ 发事件：news.ingested → ingest_event                          │
+  └───────────────────────────┬─────────────────────────────────┘
+                              │  worker 消费 news.ingested
+  ② 评分 scoring              ▼
+  ┌─────────────────────────────────────────────────────────────┐
+  │ 读：news_item(status=NEW / SCORE_FAILED)                     │
+  │ 写：news_score（历史） + news_entity（标的）                   │
+  │     + news_item.score/band/reason + status=SCORED            │
+  │ 审计：llm_call_log（flash 模型批量打分）                        │
+  │ 分支：score≤3 → news_item.status=ARCHIVED_NOISE（终态，终止） │
+  │ 发事件：news.scored（score>3）→ ingest_event                  │
+  └───────────────────────────┬─────────────────────────────────┘
+                              │  worker 消费 news.scored
+  ③ 向量化 embedding          ▼
+  ┌─────────────────────────────────────────────────────────────┐
+  │ 读：news_item(status=SCORED)                                 │
+  │ 写：news_chunk（分块 + 向量，先删后插幂等）                     │
+  │     + news_item.status=EMBEDDED                              │
+  │ 审计：llm_call_log（embedding 调用）                          │
+  │ 发事件：news.embedded → ingest_event                         │
+  └───────────────────────────┬─────────────────────────────────┘
+                              │  worker 消费 news.embedded
+  ④ 深度分析 analysis         ▼
+  ┌─────────────────────────────────────────────────────────────┐
+  │ 读：news_item(status=EMBEDDED)                               │
+  │     + news_chunk（history_search 历史检索）                   │
+  │     + 行情表（估值/走势，当前为空）                            │
+  │ 按 band 路由：                                                │
+  │   (7,10] macro_policy  (5,7] industry  (3,5] stock           │
+  │ 写：analysis_report（结构化报告）+ news_item.status=ANALYZED   │
+  │ 审计：llm_call_log（analysis 模型调用）                        │
+  │ 发事件：analysis.published → ingest_event                    │
+  └───────────────────────────┬─────────────────────────────────┘
+                              ▼
+                    前端 / 追问（chat）消费
 ```
+
+### 2.3 各阶段参与的表（汇总）
+
+| 阶段 | 触发 | 读表 | 写表 | 事件 | `news_item.status` 流转 |
+| --- | --- | --- | --- | --- | --- |
+| ① 接入 | APScheduler 每 60s | `ingest_cursor` | `news_item`、`ingest_cursor` | `news.ingested` | — → `NEW` |
+| ② 评分 | 消费 `news.ingested` | `news_item` | `news_score`、`news_entity`、`news_item` | `news.scored` | `NEW` → `SCORING` → `SCORED`（≤3 分 → `ARCHIVED_NOISE`） |
+| ③ 向量化 | 消费 `news.scored` | `news_item` | `news_chunk`、`news_item` | `news.embedded` | `SCORED` → `EMBEDDED` |
+| ④ 深度分析 | 消费 `news.embedded` | `news_item`、`news_chunk`、行情表 | `analysis_report`、`news_item` | `analysis.published` | `EMBEDDED` → `ANALYZING` → `ANALYZED` |
+| 盘前/盘后 | cron 07:30 / 15:30 | `market_daily`、`index_daily_bar`、`us_daily_bar`、`news_item` | `analysis_report`（`trade_date`+`period`） | — | 不涉及 |
+| 追问 QA | `POST /chat/...` | `news_chunk`（向量检索）、`chat_session`、`chat_message` | `chat_session`、`chat_message` | — | 不涉及 |
+
+每个阶段的模型调用都写 `llm_call_log`（provider/model/tokens/耗时/成本）。
+
+### 2.4 事件队列贯穿全流程
+
+`ingest_event` 是库内的 Outbox/Inbox 合一队列，数据与事件**同库同事务**（避免「数据已提交但事件丢失」）。
+
+```
+news.ingested ──► 评分 ──► news.scored ──► 向量化 ──► news.embedded ──► 深度分析 ──► analysis.published
+```
+
+- 软去重：`(event_type, aggregate_id)` 在 `PENDING/PROCESSING` 状态唯一，同一资讯同一阶段不重复排队
+- 失败退避：`available_at` 指数退避 + `attempts` 计数，超 `max_attempts` 转 `dead_letter`
+- 优先级：宏观(3) > 行业(2) > 个股(1)，`worker` 用 `FOR UPDATE SKIP LOCKED` 消费
 
 ---
 
