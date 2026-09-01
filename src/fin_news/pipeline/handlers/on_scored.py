@@ -53,7 +53,7 @@ async def handle(
             continue
 
         try:
-            await _vectorize(session, news, settings)
+            await vectorize_news(session, news, settings)
             news.status = NewsStatus.EMBEDDED
             await bus.publish(
                 EventType.NEWS_EMBEDDED,
@@ -73,8 +73,11 @@ async def handle(
             await bus.fail(event, str(exc)[:300], error_type="EmbeddingFailed")
 
 
-async def _vectorize(session: AsyncSession, news: NewsItem, settings: Settings) -> int:
-    """分块 → 批量 embedding → 幂等写入（先删后插）。"""
+async def vectorize_news(session: AsyncSession, news: NewsItem, settings: Settings) -> int:
+    """分块 → 批量 embedding → 幂等写入（先删后插）。
+
+    公开给运维命令（cli embed）复用，保证手动补数与事件驱动走完全一致的逻辑。
+    """
     embedder = get_embedder(settings)
     prefix = f"【{news.src_name or news.src or '资讯'}】{news.publish_time:%Y-%m-%d %H:%M} {news.title}\n"
     chunks = chunk_text(

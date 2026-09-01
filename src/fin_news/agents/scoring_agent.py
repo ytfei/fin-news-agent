@@ -10,11 +10,12 @@ from fin_news.agents.graphs.scoring_graph import ScoringRun, build_payload, run_
 from fin_news.agents.llm import get_llm_client, get_semaphore
 from fin_news.agents.prompts import SCORING_SCHEMA, SCORING_SYSTEM, SCORING_VERSION
 from fin_news.core.config import Settings, get_settings
-from fin_news.core.enums import EntityType, NewsStatus
+from fin_news.core.enums import EntityType, EventType, NewsStatus
 from fin_news.core.logging import get_logger
 from fin_news.core.timeutil import now_utc
 from fin_news.domain.schemas import ScoreBatchResult, ScoreEntity, ScoreItemResult
 from fin_news.domain.scoring import band_for_score, clamp_score
+from fin_news.events.bus import EventBus
 from fin_news.models.news import NewsEntity, NewsItem, NewsScore
 
 logger = get_logger("agents.scoring")
@@ -93,7 +94,29 @@ class ScoringAgent:
 
         batch_id = uuid.uuid4().hex[:16]
         await self._persist(session, items, result, batch_id)
+
+        # 补发下游事件：cli score 不经过事件总线，不补发的话这些资讯
+        # 永远不会进入向量化与深度分析。publish 本身幂等（部分唯一索引），
+        # 所以从 on_ingested 调用时重复发布是安全的。
+        await self._publish_scored_events(session, result)
+
         return {r.id: r for r in result.items}
+
+    async def _publish_scored_events(self, session: AsyncSession, result: ScoreBatchResult) -> int:
+        bus = EventBus(session, worker_id="scoring")
+        published = 0
+        for item in result.items:
+            event_id = await bus.publish(
+                EventType.NEWS_SCORED,
+                item.id,
+                payload={"score": item.score, "band": band_for_score(item.score).value},
+                priority=2,
+            )
+            if event_id is not None:
+                published += 1
+        if published:
+            logger.info("已补发评分事件", count=published)
+        return published
 
     # ------------------------------------------------------------------
     async def _score_legacy(self, items: list[NewsItem], expected_ids: set[int]) -> ScoreBatchResult:

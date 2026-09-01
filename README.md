@@ -104,6 +104,25 @@ uv run python -m fin_news.cli ingest     # 拉取 + 归一化 + 去重 + 落库 
 uv run python -m fin_news.cli status     # 查看位点与统计
 ```
 
+### 6b. 手动补数与状态修正
+
+事件驱动链路之外，有三个直接入口：
+
+```bash
+uv run python -m fin_news.cli score          # 只评分（评分后会自动补发 news.scored）
+uv run python -m fin_news.cli embed          # 只向量化（status=SCORED/EMBED_FAILED 且 score>3）
+uv run python -m fin_news.cli sweep          # 体检：噪声未归档 / 缺评分事件 / 分块缺失
+uv run python -m fin_news.cli sweep --apply  # 实际修正
+```
+
+`sweep` 的三类问题：
+
+| 现象 | 原因 | 修正 |
+| --- | --- | --- |
+| `status=SCORED` 但 `score<=3` | 评分发生在事件流之外 | 归档为 `ARCHIVED_NOISE` |
+| `status=SCORED` 且 `score>3` 但没有 `news.scored` 事件 | 同上 | 补发事件，进入向量化 |
+| `status=EMBEDDED` 但没有分块 | 向量化写入失败 | 打回 `SCORED` 并补发事件重跑 |
+
 ### 7. 启动服务（接入调度 + Pipeline + API）
 
 ```bash
@@ -170,7 +189,9 @@ src/fin_news/
 | --- | --- |
 | `uv run python -m fin_news.cli selftest` | 数据源与模型凭据自检 |
 | `uv run python -m fin_news.cli ingest` | 手动跑一次增量接入 |
-| `uv run python -m fin_news.cli score` | 给待评分资讯打分 |
+| `uv run python -m fin_news.cli score` | 给待评分资讯打分（并自动补发下游事件） |
+| `uv run python -m fin_news.cli embed` | **直接向量化**已评分资讯，不依赖事件队列（`--limit N`） |
+| `uv run python -m fin_news.cli sweep` | 扫描状态与事件的不一致（dry-run）；`--apply` 实际修正 |
 | `uv run python -m fin_news.cli pipeline` | 消费一轮事件（评分→向量化→分析） |
 | `uv run python -m fin_news.cli worker` | 常驻 pipeline worker |
 | `uv run python -m fin_news.cli premarket` | 生成当日盘前简报 |

@@ -4,7 +4,11 @@
     uv run python -m fin_news.cli ingest           # 手动跑一次增量接入
     uv run python -m fin_news.cli pipeline         # 消费事件（跑一轮）
     uv run python -m fin_news.cli worker           # 常驻 worker
-    uv run python -m fin_news.cli score            # 给待评分资讯打分
+    uv run python -m fin_news.cli score            # 给待评分资讯打分（并补发下游事件）
+    uv run python -m fin_news.cli embed            # 直接向量化已评分资讯（不依赖事件队列）
+    uv run python -m fin_news.cli embed --limit 20
+    uv run python -m fin_news.cli sweep            # 扫描状态与事件不一致（dry-run）
+    uv run python -m fin_news.cli sweep --apply    # 实际修正
     uv run python -m fin_news.cli premarket        # 生成盘前简报
     uv run python -m fin_news.cli postmarket       # 生成盘后简报
     uv run python -m fin_news.cli status           # 查看积压与统计
@@ -63,6 +67,200 @@ async def _cmd_score() -> int:
     async with session_scope() as session:
         n = await ScoringAgent().score_pending(session)
         print(f"已评分：{n}")
+    return 0
+
+
+async def _cmd_embed(limit: int | None = None) -> int:
+    """直接向量化已评分的资讯，不依赖事件队列。
+
+    用途：补数、事件已 DONE 但资讯未向量化、或只想验证 embedding 链路。
+    """
+    from sqlalchemy import select
+
+    from fin_news.agents.embeddings import DimensionMismatch
+    from fin_news.core.db import init_db, session_scope
+    from fin_news.core.enums import EventType, NewsStatus
+    from fin_news.core.logging import get_logger
+    from fin_news.domain.scoring import should_vectorize
+    from fin_news.events.bus import EventBus
+    from fin_news.models.news import NewsItem
+    from fin_news.pipeline.handlers.on_scored import vectorize_news
+
+    settings = get_settings()
+    if not settings.has_llm_credentials():
+        print("未配置模型 API Key，无法向量化")
+        return 1
+
+    await init_db()
+    batch = limit or settings.scoring_batch_size * 10
+    embedded = skipped = failed = 0
+
+    async with session_scope() as session:
+        rows = await session.execute(
+            select(NewsItem)
+            .where(
+                NewsItem.status.in_([NewsStatus.SCORED, NewsStatus.EMBED_FAILED]),
+                NewsItem.score.is_not(None),
+            )
+            .order_by(NewsItem.publish_time)
+            .limit(batch)
+        )
+        items = list(rows.scalars().all())
+        if not items:
+            print("没有待向量化的资讯（要求 status=SCORED/EMBED_FAILED 且 score 非空）")
+            return 0
+
+        bus = EventBus(session, worker_id="cli-embed")
+        for news in items:
+            if not should_vectorize(news.score, settings.score_threshold_vectorize):
+                news.status = NewsStatus.ARCHIVED_NOISE
+                news.analysis_status = "NONE"
+                skipped += 1
+                continue
+
+            try:
+                # 用 SAVEPOINT 隔离单条失败，避免脏写入留在事务里
+                async with session.begin_nested():
+                    chunks = await vectorize_news(session, news, settings)
+            except DimensionMismatch as exc:
+                print(f"向量维度不匹配，终止：{exc}")
+                return 1
+            except Exception as exc:  # noqa: BLE001
+                news.status = NewsStatus.EMBED_FAILED
+                news.retry_count = (news.retry_count or 0) + 1
+                news.last_error = str(exc)[:500]
+                failed += 1
+                continue
+
+            news.status = NewsStatus.EMBEDDED
+            news.analysis_status = "PENDING"
+            news.last_error = None
+            logger.info("已向量化", news_id=news.id, chunks=chunks, score=news.score)
+            await bus.publish(
+                EventType.NEWS_EMBEDDED,
+                news.id,
+                payload={"score": news.score, "band": news.band.value if news.band else None},
+                priority=2,
+            )
+            embedded += 1
+            # 逐条提交：量大时已完成的结果立即可见
+            await session.commit()
+
+    get_logger("cli.embed").info(
+        "向量化完成", embedded=embedded, skipped=skipped, failed=failed
+    )
+    print(f"已向量化：{embedded}，归档为噪声：{skipped}，失败：{failed}")
+    return 0 if failed == 0 else 1
+
+
+async def _cmd_sweep(apply: bool = False) -> int:
+    """扫描并修正「资讯状态」与「事件」之间的不一致。
+
+    三类问题：
+    1. status=SCORED 但 score<=3  → 应为 ARCHIVED_NOISE（不该再向量化）
+    2. status=SCORED 且 score>3 但没有 news.scored 事件 → 补发（否则永远不向量化）
+    3. status=EMBEDDED 但没有分块 → 打回 SCORED 并补发事件，重新向量化
+    """
+    from sqlalchemy import select
+
+    from fin_news.core.db import init_db, session_scope
+    from fin_news.core.enums import EventStatus, EventType, NewsStatus
+    from fin_news.core.logging import get_logger
+    from fin_news.domain.scoring import should_vectorize
+    from fin_news.events.bus import EventBus
+    from fin_news.models.event import IngestEvent
+    from fin_news.models.news import NewsChunk, NewsItem
+
+    settings = get_settings()
+    await init_db()
+
+    to_archive: list[int] = []
+    to_publish: list[tuple[int, int]] = []  # (news_id, score)
+    to_revectorize: list[int] = []
+
+    async with session_scope() as session:
+        rows = await session.execute(
+            select(NewsItem).where(
+                NewsItem.status.in_(
+                    [NewsStatus.SCORED, NewsStatus.EMBED_FAILED, NewsStatus.EMBEDDED]
+                )
+            )
+        )
+        items = list(rows.scalars().all())
+
+        scored_events = {
+            r[0]
+            for r in (
+                await session.execute(
+                    select(IngestEvent.aggregate_id).where(
+                        IngestEvent.event_type == EventType.NEWS_SCORED.value,
+                        IngestEvent.status.in_(
+                            [EventStatus.PENDING, EventStatus.PROCESSING, EventStatus.DONE]
+                        ),
+                    )
+                )
+            ).all()
+        }
+        chunked = {
+            r[0]
+            for r in (
+                await session.execute(
+                    select(NewsChunk.news_id).group_by(NewsChunk.news_id)
+                )
+            ).all()
+        }
+
+        for news in items:
+            if news.status in (NewsStatus.SCORED, NewsStatus.EMBED_FAILED):
+                if news.score is None:
+                    continue
+                if not should_vectorize(news.score, settings.score_threshold_vectorize):
+                    to_archive.append(news.id)
+                elif news.id not in scored_events:
+                    to_publish.append((news.id, news.score))
+            elif news.status == NewsStatus.EMBEDDED and news.id not in chunked:
+                to_revectorize.append(news.id)
+
+    print(
+        f"扫描结果：噪声待归档 {len(to_archive)}，"
+        f"缺评分事件 {len(to_publish)}，分块缺失待重跑 {len(to_revectorize)}"
+    )
+    if not apply:
+        print("（dry-run，加 --apply 才会实际修改）")
+        return 0
+
+    fixed = 0
+    async with session_scope() as session:
+        bus = EventBus(session, worker_id="cli-sweep")
+        if to_archive:
+            rows = await session.execute(
+                select(NewsItem).where(NewsItem.id.in_(to_archive))
+            )
+            for news in rows.scalars().all():
+                news.status = NewsStatus.ARCHIVED_NOISE
+                news.analysis_status = "NONE"
+                fixed += 1
+        for news_id, score in to_publish:
+            if await bus.publish(
+                EventType.NEWS_SCORED, news_id, payload={"score": score}, priority=2
+            ):
+                fixed += 1
+        for news_id in to_revectorize:
+            rows = await session.execute(select(NewsItem).where(NewsItem.id == news_id))
+            news = rows.scalar_one_or_none()
+            if news is not None:
+                news.status = NewsStatus.SCORED
+                news.analysis_status = "PENDING"
+            if await bus.publish(
+                EventType.NEWS_SCORED, news_id, payload={"sweep": True}, priority=2
+            ):
+                fixed += 1
+
+    get_logger("cli.sweep").info(
+        "状态修正完成", archived=len(to_archive), published=len(to_publish),
+        revectorize=len(to_revectorize),
+    )
+    print(f"已修正：{fixed} 项")
     return 0
 
 
@@ -382,6 +580,10 @@ async def _dispatch(args: argparse.Namespace) -> int:
         return await _cmd_pipeline(once=False)
     if args.command == "score":
         return await _cmd_score()
+    if args.command == "embed":
+        return await _cmd_embed(limit=getattr(args, "limit", None))
+    if args.command == "sweep":
+        return await _cmd_sweep(apply=getattr(args, "apply", False))
     if args.command == "premarket":
         return await _cmd_market("pre")
     if args.command == "postmarket":
@@ -404,11 +606,19 @@ def main() -> None:
             "pipeline",
             "worker",
             "score",
+            "embed",
+            "sweep",
             "premarket",
             "postmarket",
             "status",
             "selftest",
         ],
+    )
+    parser.add_argument(
+        "--limit", type=int, default=None, help="embed：本轮最多处理的资讯条数"
+    )
+    parser.add_argument(
+        "--apply", action="store_true", help="sweep：实际执行修正（默认只扫描不修改）"
     )
     args = parser.parse_args()
     sys.exit(asyncio.run(_dispatch(args)))
