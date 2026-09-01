@@ -35,16 +35,20 @@ def _build_chat_model(role: str = "analysis", settings: Settings | None = None):
     """构造 LangChain ChatModel（OpenAI 兼容，火山引擎 / DeepSeek 均可）。"""
     from langchain_openai import ChatOpenAI
 
+    from fin_news.agents.llm.callbacks import AuditCallbackHandler
+
     settings = settings or get_settings()
     provider = settings.llm_default_provider
     cfg = settings.provider(provider)  # type: ignore[arg-type]
+    model = settings.model_for(provider, role)  # type: ignore[arg-type]
     return ChatOpenAI(
         base_url=cfg.base_url,
         api_key=cfg.api_key,
-        model=settings.model_for(provider, role),  # type: ignore[arg-type]
+        model=model,
         temperature=0.2,
         timeout=settings.llm_timeout_seconds,
         max_retries=settings.llm_max_retries,
+        callbacks=[AuditCallbackHandler(role=role, provider=provider, model=model)],
     )
 
 

@@ -17,15 +17,22 @@ doubao-embedding-vision 与旧文本模型（doubao-embedding-text-240715）的�
 from __future__ import annotations
 
 import asyncio
+import time
+import uuid
 from typing import Any
 
 import httpx
 
 from fin_news.agents.llm.client import LLMUnavailable
 from fin_news.core.config import Settings, get_settings
+from fin_news.core.db import session_scope
 from fin_news.core.logging import get_logger
+from fin_news.models.event import LLMCallLog
 
 logger = get_logger("agents.embedding")
+
+# 粗略成本估算（分/千 token），与 llm/callbacks.py 的 embedding 单价一致
+_EMBEDDING_PRICE_PER_1K_CENT = 0.01
 
 
 class DimensionMismatch(ValueError):
@@ -91,9 +98,56 @@ class Embedder:
 
     async def _embed_one(self, text: str) -> list[float]:
         url, headers = self._endpoint()
-        resp = await self.client.post(url, json=self._payload(text), headers=headers)
-        resp.raise_for_status()
-        return self._parse_response(resp.json())
+        model = self.settings.model_for(self.settings.embedding_provider, "embedding")
+        started = time.perf_counter()
+        try:
+            resp = await self.client.post(url, json=self._payload(text), headers=headers)
+            resp.raise_for_status()
+            data = resp.json()
+            vec = self._parse_response(data)
+        except Exception as exc:  # noqa: BLE001
+            latency_ms = int((time.perf_counter() - started) * 1000)
+            await self._log_call(model=model, prompt_tokens=0, latency_ms=latency_ms,
+                                 status="ERROR", error=str(exc)[:500])
+            raise
+
+        usage = data.get("usage") or {}
+        prompt_tokens = int(usage.get("input_tokens") or usage.get("total_tokens") or 0)
+        latency_ms = int((time.perf_counter() - started) * 1000)
+        await self._log_call(model=model, prompt_tokens=prompt_tokens, latency_ms=latency_ms,
+                             status="OK")
+        return vec
+
+    async def _log_call(
+        self,
+        *,
+        model: str,
+        prompt_tokens: int,
+        latency_ms: int,
+        status: str,
+        error: str | None = None,
+    ) -> None:
+        """写一次 embedding 调用到 llm_call_log（审计与成本）。"""
+        try:
+            async with session_scope() as session:
+                session.add(
+                    LLMCallLog(
+                        trace_id=uuid.uuid4().hex[:16],
+                        provider=self.settings.embedding_provider,
+                        role="embedding",
+                        model=model,
+                        is_fallback=False,
+                        request_chars=0,
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=0,
+                        latency_ms=latency_ms,
+                        status=status,
+                        error_message=error,
+                        cost_cent=round(prompt_tokens / 1000 * _EMBEDDING_PRICE_PER_1K_CENT, 4),
+                    )
+                )
+        except Exception as exc:  # noqa: BLE001 - 审计失败不能影响主流程
+            logger.warning("写入 embedding 调用日志失败", error=str(exc)[:200])
 
     @staticmethod
     def _parse_response(data: dict[str, Any]) -> list[float]:

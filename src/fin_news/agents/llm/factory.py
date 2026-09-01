@@ -12,6 +12,7 @@ from typing import Any
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_openai import ChatOpenAI
 
+from fin_news.agents.llm.callbacks import AuditCallbackHandler
 from fin_news.agents.llm.client import LLMUnavailable
 from fin_news.core.config import LLMRole, ProviderName, Settings, get_settings
 from fin_news.core.logging import get_logger
@@ -47,13 +48,16 @@ class ModelFactory:
 
         key = (provider, role)
         if key not in self._cache:
+            model = self.settings.model_for(provider, role)
             self._cache[key] = ChatOpenAI(
                 base_url=cfg.base_url,
                 api_key=cfg.api_key,
-                model=self.settings.model_for(provider, role),
+                model=model,
                 temperature=_TEMPERATURE.get(role, 0.2),
                 timeout=self.settings.llm_timeout_seconds,
                 max_retries=self.settings.llm_max_retries,
+                # 审计回调：每次 LLM 调用写一行 llm_call_log（走 LangChain 的评分/分析路径）
+                callbacks=[AuditCallbackHandler(role=role, provider=provider, model=model)],
             )
         return self._cache[key]
 
