@@ -1,15 +1,45 @@
 """应用配置（pydantic-settings，从 .env / 环境变量读取）。"""
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import Field
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field, field_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 ProviderName = Literal["volcengine", "deepseek"]
 LLMRole = Literal["scoring", "analysis", "qa", "embedding"]
+
+
+def parse_str_list(value: object) -> list[str]:
+    """把 ".env / 环境变量" 里的列表值解析成 list[str]。
+
+    同时兼容以下写法（shell 插件 source .env 时会吃掉引号，必须容错）：
+
+        NEWS_SOURCES=["cls","wallstreetcn"]   # JSON
+        NEWS_SOURCES=[cls,wallstreetcn]       # 引号被 shell 吃掉后的形态
+        NEWS_SOURCES=cls,wallstreetcn         # 逗号分隔
+    """
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        return [str(v).strip() for v in value if str(v).strip()]
+
+    text = str(value).strip()
+    if not text:
+        return []
+    if text.startswith("["):
+        try:
+            parsed = json.loads(text)
+        except (ValueError, TypeError):
+            parsed = None
+        if isinstance(parsed, list):
+            return [str(x).strip() for x in parsed if str(x).strip()]
+        # JSON 解析失败（引号被 shell 吃掉）时退化为去掉方括号再切分
+        text = text.strip("[]")
+    return [part.strip().strip("'\"") for part in text.split(",") if part.strip()]
 
 
 @dataclass(frozen=True)
@@ -63,7 +93,9 @@ class Settings(BaseSettings):
     tushare_token: str = ""
     tushare_timeout: int = 30
     tushare_qps: float = 3.0
-    news_sources: list[str] = Field(default_factory=lambda: ["cls", "wallstreetcn"])
+    news_sources: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["cls", "wallstreetcn"]
+    )
 
     # ---------------- 接入调度 ----------------
     ingest_interval_seconds: int = 60
@@ -131,7 +163,12 @@ class Settings(BaseSettings):
 
     # ---------------- API ----------------
     api_prefix: str = "/api/v1"
-    cors_origins: list[str] = Field(default_factory=lambda: ["*"])
+    cors_origins: Annotated[list[str], NoDecode] = Field(default_factory=lambda: ["*"])
+
+    @field_validator("news_sources", "cors_origins", mode="before")
+    @classmethod
+    def _coerce_str_list(cls, value: object) -> list[str]:
+        return parse_str_list(value)
 
     # ---------------- 派生方法 ----------------
     def provider(self, name: ProviderName) -> ProviderConfig:

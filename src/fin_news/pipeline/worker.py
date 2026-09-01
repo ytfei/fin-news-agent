@@ -64,32 +64,47 @@ class PipelineWorker:
 
     async def tick(self) -> int:
         """拉取一批事件并处理，返回处理条数。"""
+        # 拉取事件单独一个事务，处理阶段按事件类型分组各自开事务
         async with session_scope() as session:
             bus = EventBus(session, self.worker_id)
             events = list(await bus.poll(self.settings.worker_batch_limit))
-            if not events:
-                return 0
+        if not events:
+            return 0
 
-            grouped: dict[str, list[IngestEvent]] = defaultdict(list)
-            for event in events:
-                grouped[event.event_type].append(event)
+        grouped: dict[str, list[IngestEvent]] = defaultdict(list)
+        for event in events:
+            grouped[event.event_type].append(event)
 
-            processed = 0
-            for event_type, group in grouped.items():
-                batch = self._take_batch(event_type, group)
-                if not batch:
-                    continue
-                handler = HANDLERS.get(event_type)
-                if handler is None:
-                    logger.warning("无对应处理器", event_type=event_type)
+        processed = 0
+        for event_type, group in grouped.items():
+            batch = self._take_batch(event_type, group)
+            if not batch:
+                continue
+
+            handler = HANDLERS.get(event_type)
+            try:
+                async with session_scope() as group_session:
+                    group_bus = EventBus(group_session, self.worker_id)
+                    if handler is None:
+                        logger.warning("无对应处理器", event_type=event_type)
+                        for event in batch:
+                            await group_bus.ack(event)
+                    else:
+                        await handler(group_session, batch, group_bus, self.settings)
+            except Exception as exc:  # noqa: BLE001
+                # 处理器抛异常时不能让 worker 主循环退出，
+                # 否则事件会一直卡在 PROCESSING 直到 reclaim
+                logger.exception(
+                    "事件处理异常", event_type=event_type, count=len(batch), error=str(exc)[:300]
+                )
+                async with session_scope() as err_session:
+                    err_bus = EventBus(err_session, self.worker_id)
                     for event in batch:
-                        await bus.ack(event)
-                    continue
-                await handler(session, batch, bus, self.settings)
-                processed += len(batch)
+                        await err_bus.fail(event, str(exc)[:300], error_type="HandlerCrash")
+            processed += len(batch)
 
-            # 未达到触发条件的事件留在攒批器里，等下一轮
-            return processed
+        # 未达到触发条件的事件留在攒批器里，等下一轮
+        return processed
 
     async def flush(self) -> None:
         """优雅退出：把攒批器中未处理的事件放回队列。"""

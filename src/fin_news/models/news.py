@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from pgvector.sqlalchemy import Vector
+from pgvector.sqlalchemy import HALFVEC
 from sqlalchemy import (
     JSON,
     BigInteger,
@@ -24,6 +24,10 @@ from fin_news.core.enums import EntityType, IngestKind, NewsStatus, ScoreBand
 from fin_news.models.base import Base, PublicIdMixin, TimestampMixin, fk, pg_enum
 
 VECTOR_DIM = get_settings().embedding_dim
+
+# 火山 doubao-embedding-text-240715 固定输出 2560 维，超过 HNSW 的 2000 维上限，
+# 因此列类型用 halfvec（HNSW 支持 halfvec 到 4000 维，且存储减半）。
+VECTOR_TYPE = HALFVEC
 
 score_band_t = pg_enum(ScoreBand, "score_band")
 news_status_t = pg_enum(NewsStatus, "news_status")
@@ -127,7 +131,7 @@ class NewsChunk(Base, TimestampMixin):
             "embedding",
             postgresql_using="hnsw",
             postgresql_with={"m": 16, "ef_construction": 64},
-            postgresql_ops={"embedding": "vector_cosine_ops"},
+            postgresql_ops={"embedding": "halfvec_cosine_ops"},
         ),
         Index("idx_chunk_news", "news_id"),
         Index("idx_chunk_entities", "entity_codes", postgresql_using="gin"),
@@ -139,7 +143,7 @@ class NewsChunk(Base, TimestampMixin):
 
     content: Mapped[str] = mapped_column(Text, nullable=False)
     token_count: Mapped[int | None] = mapped_column(Integer)
-    embedding: Mapped[list[float]] = mapped_column(Vector(VECTOR_DIM), nullable=False)
+    embedding: Mapped[list[float]] = mapped_column(VECTOR_TYPE(VECTOR_DIM), nullable=False)
 
     # 冗余字段：便于检索时单表过滤
     score: Mapped[int | None] = mapped_column(SmallInteger)

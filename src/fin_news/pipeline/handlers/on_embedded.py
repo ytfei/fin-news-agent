@@ -43,17 +43,20 @@ async def handle(
         news = items.get(event.aggregate_id)
         if news is None:
             await bus.ack(event)
+            await session.commit()
             continue
 
         agent_type = agent_for_score(news.score)
         if agent_type is None:
             await bus.ack(event)
+            await session.commit()
             continue
 
         try:
             report = await analyze_news(session, news, settings)
             if report is None:
                 await bus.ack(event)
+                await session.commit()
                 continue
             await bus.publish(
                 EventType.ANALYSIS_PUBLISHED,
@@ -69,3 +72,5 @@ async def handle(
             news.retry_count = (news.retry_count or 0) + 1
             news.last_error = str(exc)[:500]
             await bus.fail(event, str(exc)[:300], error_type="AnalysisFailed")
+        # 单条分析耗时长，逐条提交，保证已完成的结果立即可见且不因异常整体回滚
+        await session.commit()
