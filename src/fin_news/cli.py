@@ -13,6 +13,9 @@
     uv run python -m fin_news.cli postmarket       # 生成盘后简报
     uv run python -m fin_news.cli status           # 查看积压与统计
     uv run python -m fin_news.cli selftest         # 数据源 / LLM / Embedding 连通性自检
+
+日志级别：默认 INFO；`-v` 升到 DEBUG（看业务 debug 日志）；`-vv` 再把
+第三方库（httpx/openai/sqlalchemy 等）的日志也放开到 DEBUG。
 """
 from __future__ import annotations
 
@@ -27,19 +30,28 @@ from fin_news.core.logging import configure_logging, get_logger
 if TYPE_CHECKING:
     from fin_news.agents.embeddings import Embedder
 
-logger = get_logger("cli")
+# 不在模块级调用 get_logger —— 那会在 import 时就用默认级别完成日志配置，导致
+# -v/-vv 无法生效。日志级别统一由 main() 解析参数后配置，各命令函数内再 get_logger
+# 拿到的即是按 verbosity 配置好的 logger。
+_LOG_NAME = "cli"
 
 
 async def _cmd_ingest() -> int:
     from fin_news.core.db import init_db
     from fin_news.ingestion.service import IngestionService
 
+    logger = get_logger(_LOG_NAME)
     await init_db()
     results = await IngestionService().run_all()
     for r in results:
-        print(
-            f"[{r.status:8}] {r.source_key}: fetched={r.fetched} "
-            + f"inserted={r.inserted} duplicates={r.duplicates} filtered={r.filtered}"
+        logger.info(
+            "接入结果",
+            source_key=r.source_key,
+            status=r.status,
+            fetched=r.fetched,
+            inserted=r.inserted,
+            duplicates=r.duplicates,
+            filtered=r.filtered,
         )
     return 0
 
@@ -48,13 +60,15 @@ async def _cmd_pipeline(once: bool = True) -> int:
     from fin_news.core.db import init_db
     from fin_news.pipeline.worker import PipelineWorker
 
+    logger = get_logger(_LOG_NAME)
     await init_db()
     worker = PipelineWorker()
     if once:
         await worker.reclaim()
         n = await worker.tick()
-        print(f"本轮处理事件：{n}")
+        logger.info("本轮处理事件", count=n)
         return 0
+    logger.info("启动常驻 worker")
     await worker.run_forever()
     return 0
 
@@ -63,10 +77,11 @@ async def _cmd_score() -> int:
     from fin_news.agents.scoring_agent import ScoringAgent
     from fin_news.core.db import init_db, session_scope
 
+    logger = get_logger(_LOG_NAME)
     await init_db()
     async with session_scope() as session:
         n = await ScoringAgent().score_pending(session)
-        print(f"已评分：{n}")
+        logger.info("已评分", count=n)
     return 0
 
 
@@ -80,15 +95,15 @@ async def _cmd_embed(limit: int | None = None) -> int:
     from fin_news.agents.embeddings import DimensionMismatch
     from fin_news.core.db import init_db, session_scope
     from fin_news.core.enums import EventType, NewsStatus
-    from fin_news.core.logging import get_logger
     from fin_news.domain.scoring import should_vectorize
     from fin_news.events.bus import EventBus
     from fin_news.models.news import NewsItem
     from fin_news.pipeline.handlers.on_scored import vectorize_news
 
+    logger = get_logger(_LOG_NAME)
     settings = get_settings()
     if not settings.has_llm_credentials():
-        print("未配置模型 API Key，无法向量化")
+        logger.warning("未配置模型 API Key，无法向量化")
         return 1
 
     await init_db()
@@ -107,7 +122,7 @@ async def _cmd_embed(limit: int | None = None) -> int:
         )
         items = list(rows.scalars().all())
         if not items:
-            print("没有待向量化的资讯（要求 status=SCORED/EMBED_FAILED 且 score 非空）")
+            logger.info("没有待向量化的资讯（要求 status=SCORED/EMBED_FAILED 且 score 非空）")
             return 0
 
         bus = EventBus(session, worker_id="cli-embed")
@@ -123,7 +138,7 @@ async def _cmd_embed(limit: int | None = None) -> int:
                 async with session.begin_nested():
                     chunks = await vectorize_news(session, news, settings)
             except DimensionMismatch as exc:
-                print(f"向量维度不匹配，终止：{exc}")
+                logger.error("向量维度不匹配，终止", error=str(exc))
                 return 1
             except Exception as exc:  # noqa: BLE001
                 news.status = NewsStatus.EMBED_FAILED
@@ -146,10 +161,7 @@ async def _cmd_embed(limit: int | None = None) -> int:
             # 逐条提交：量大时已完成的结果立即可见
             await session.commit()
 
-    get_logger("cli.embed").info(
-        "向量化完成", embedded=embedded, skipped=skipped, failed=failed
-    )
-    print(f"已向量化：{embedded}，归档为噪声：{skipped}，失败：{failed}")
+    logger.info("向量化完成", embedded=embedded, skipped=skipped, failed=failed)
     return 0 if failed == 0 else 1
 
 
@@ -165,12 +177,12 @@ async def _cmd_sweep(apply: bool = False) -> int:
 
     from fin_news.core.db import init_db, session_scope
     from fin_news.core.enums import EventStatus, EventType, NewsStatus
-    from fin_news.core.logging import get_logger
     from fin_news.domain.scoring import should_vectorize
     from fin_news.events.bus import EventBus
     from fin_news.models.event import IngestEvent
     from fin_news.models.news import NewsChunk, NewsItem
 
+    logger = get_logger(_LOG_NAME)
     settings = get_settings()
     await init_db()
 
@@ -221,12 +233,14 @@ async def _cmd_sweep(apply: bool = False) -> int:
             elif news.status == NewsStatus.EMBEDDED and news.id not in chunked:
                 to_revectorize.append(news.id)
 
-    print(
-        f"扫描结果：噪声待归档 {len(to_archive)}，"
-        f"缺评分事件 {len(to_publish)}，分块缺失待重跑 {len(to_revectorize)}"
+    logger.info(
+        "扫描结果",
+        archive=len(to_archive),
+        publish=len(to_publish),
+        revectorize=len(to_revectorize),
     )
     if not apply:
-        print("（dry-run，加 --apply 才会实际修改）")
+        logger.info("dry-run 模式，未做修改（加 --apply 才会实际执行）")
         return 0
 
     fixed = 0
@@ -256,11 +270,7 @@ async def _cmd_sweep(apply: bool = False) -> int:
             ):
                 fixed += 1
 
-    get_logger("cli.sweep").info(
-        "状态修正完成", archived=len(to_archive), published=len(to_publish),
-        revectorize=len(to_revectorize),
-    )
-    print(f"已修正：{fixed} 项")
+    logger.info("状态修正完成", fixed=fixed)
     return 0
 
 
@@ -268,12 +278,13 @@ async def _cmd_market(period: str) -> int:
     from fin_news.agents.market_agents import run_post_market, run_pre_market
     from fin_news.core.db import init_db
 
+    logger = get_logger(_LOG_NAME)
     await init_db()
     report = await run_pre_market() if period == "pre" else await run_post_market()
     if report is None:
-        print("未生成简报（非交易日或未配置模型 Key）")
+        logger.warning("未生成简报（非交易日或未配置模型 Key）", period=period)
         return 1
-    print(f"简报已生成：{report.id} / {report.title}")
+    logger.info("简报已生成", period=period, report_id=report.id, title=report.title)
     return 0
 
 
@@ -285,6 +296,7 @@ async def _cmd_status() -> int:
     from fin_news.models.analysis import IngestCursor
     from fin_news.models.news import NewsItem
 
+    logger = get_logger(_LOG_NAME)
     await init_db()
     async with session_scope() as session:
         backlog = await EventBus(session).backlog()
@@ -292,29 +304,42 @@ async def _cmd_status() -> int:
         scored = await session.scalar(
             select(func.count()).select_from(NewsItem).where(NewsItem.score.is_not(None))
         )
-        print(f"积压：{backlog}")
-        print(f"资讯总数：{total}，已评分：{scored}")
+        logger.info("统计", backlog=backlog, total=total, scored=scored)
         rows = (await session.execute(select(IngestCursor))).scalars().all()
         for c in rows:
-            print(
-                f"  位点 {c.source_key}: {c.cursor_time} 状态={c.last_status} "
-                + f"上次条数={c.last_count} enabled={c.enabled}"
+            logger.info(
+                "接入位点",
+                source_key=c.source_key,
+                cursor_time=str(c.cursor_time),
+                last_status=c.last_status,
+                last_count=c.last_count,
+                enabled=c.enabled,
             )
     return 0
 
 
 async def _cmd_selftest() -> int:
     """数据源 / LLM / Embedding 连通性自检。"""
+    logger = get_logger(_LOG_NAME)
     settings = get_settings()
-    print(f"数据源：{settings.news_sources}")
-    print(f"LLM 凭据：{'已配置' if settings.has_llm_credentials() else '未配置（分析链路将跳过）'}")
+    logger.info(
+        "自检开始",
+        sources=settings.news_sources,
+        llm_configured=settings.has_llm_credentials(),
+    )
 
     source_ok = await _selftest_sources(settings)
     llm_ok = await _selftest_llm(settings)
     embed_ok = await _selftest_embedding(settings)
 
     all_ok = source_ok and llm_ok and embed_ok
-    print("\n自检结果：" + ("全部通过" if all_ok else "存在问题，见上方 [FAIL]/[WARN] 项"))
+    logger.info(
+        "自检结果",
+        result="全部通过" if all_ok else "存在问题",
+        sources=source_ok,
+        llm=llm_ok,
+        embedding=embed_ok,
+    )
     return 0 if all_ok else 1
 
 
@@ -326,11 +351,11 @@ async def _selftest_sources(settings: Settings) -> bool:
     from fin_news.ingestion.sources.tushare_news import TushareNewsSource
     from fin_news.ingestion.tushare_client import TusharePermissionError, get_tushare_client
 
-    print("\n数据源自检：")
+    logger = get_logger(_LOG_NAME)
     try:
         client = get_tushare_client(settings)
     except ValueError as exc:
-        print(f"  [FAIL] Tushare 客户端初始化失败：{exc}")
+        logger.error("数据源自检失败", detail=f"Tushare 客户端初始化失败：{exc}")
         return False
 
     ok = True
@@ -338,16 +363,18 @@ async def _selftest_sources(settings: Settings) -> bool:
         source = TushareNewsSource(src, client=client, settings=settings)
         try:
             items = await source.fetch(now() - timedelta(hours=3), now())
-            print(f"  [OK] {src}: 近 3 小时 {len(items)} 条")
+            logger.info("数据源自检通过", source=src, count=len(items))
             if items:
                 sample = items[0]
-                print(f"       样例标题：{sample.title or '(无标题，接入时会兜底)'}")
+                logger.info("数据源样例", source=src, title=sample.title or "(无标题，接入时会兜底)")
         except TusharePermissionError as exc:
             ok = False
-            print(f"  [FAIL] {src}: 无权限 -> {exc}")
+            logger.error("数据源自检失败", source=src, detail=f"无权限 -> {exc}")
         except Exception as exc:  # noqa: BLE001
             ok = False
-            print(f"  [FAIL] {src}: {type(exc).__name__} -> {str(exc)[:200]}")
+            logger.error(
+                "数据源自检失败", source=src, detail=f"{type(exc).__name__} -> {str(exc)[:200]}"
+            )
     return ok
 
 
@@ -355,9 +382,9 @@ async def _selftest_llm(settings: Settings) -> bool:
     """逐个角色做一次最小调用，验证模型可用 + JSON 结构化输出 + 是否走了降级。"""
     from fin_news.agents.llm.client import LLMUnavailable, get_llm_client
 
-    print("\nLLM 自检（每个角色一次最小调用，验证 JSON 结构化输出）：")
+    logger = get_logger(_LOG_NAME)
     if not settings.has_llm_credentials():
-        print("  [SKIP] 未配置任何模型 API Key，评分 / 分析 / 追问链路会跳过")
+        logger.warning("LLM 自检跳过", detail="未配置任何模型 API Key，评分 / 分析 / 追问链路会跳过")
         return True
 
     client = get_llm_client(settings)
@@ -376,33 +403,38 @@ async def _selftest_llm(settings: Settings) -> bool:
             )
         except LLMUnavailable as exc:
             ok = False
-            print(f"  [FAIL] {role}: 主备模型均不可用 -> {str(exc)[:200]}")
+            logger.error("LLM 自检失败", role=role, detail=f"主备模型均不可用 -> {str(exc)[:200]}")
             continue
         except Exception as exc:  # noqa: BLE001
             ok = False
-            print(f"  [FAIL] {role}: {type(exc).__name__} -> {str(exc)[:200]}")
+            logger.error("LLM 自检失败", role=role, detail=f"{type(exc).__name__} -> {str(exc)[:200]}")
             continue
 
         structured = resp.data is not None
         if resp.is_fallback:
             degraded_roles.append(role)
-        flag = "OK" if structured else "WARN"
         if not structured:
             ok = False
-        print(
-            f"  [{flag}] {role}: provider={resp.provider} model={resp.model}"
-            + (" (降级到备 provider)" if resp.is_fallback else "")
-            + f" 延迟={resp.latency_ms}ms tokens={resp.prompt_tokens}+{resp.completion_tokens}"
-            + f" 结构化输出={'正常' if structured else '解析失败 -> ' + (resp.content or '')[:60]}"
+        fields = dict(
+            role=role,
+            provider=resp.provider,
+            model=resp.model,
+            fallback=resp.is_fallback,
+            latency_ms=resp.latency_ms,
+            prompt_tokens=resp.prompt_tokens,
+            completion_tokens=resp.completion_tokens,
+            structured=structured,
         )
+        if structured:
+            logger.info("LLM 自检通过", **fields)
+        else:
+            logger.warning("LLM 自检（结构化输出异常）", **fields)
 
     if degraded_roles:
-        # 主 provider 模型不可用（常见原因：模型名不存在 / 无权限），全链路都在走备 provider
-        roles = ", ".join(degraded_roles)
-        provider_name = settings.llm_default_provider
-        print(
-            f"  [WARN] {roles} 走了备 provider，"
-            + f"请检查 {provider_name} 的模型名是否为账号下真实存在的模型 ID"
+        logger.warning(
+            "有角色走了备 provider",
+            roles=", ".join(degraded_roles),
+            detail=f"请检查 {settings.llm_default_provider} 的模型名是否为账号下真实存在的模型 ID",
         )
     return ok
 
@@ -413,12 +445,12 @@ async def _selftest_embedding(settings: Settings) -> bool:
 
     from fin_news.agents.embeddings import DimensionMismatch, Embedder
 
-    print("\nEmbedding 自检：")
+    logger = get_logger(_LOG_NAME)
     provider = settings.embedding_provider
     model = settings.model_for(provider, "embedding")  # type: ignore[arg-type]
     cfg = settings.provider(provider)  # type: ignore[arg-type]
     if not cfg.api_key:
-        print(f"  [SKIP] {provider} 未配置 api_key，score>3 的资讯无法向量化（检索与历史分析会失效）")
+        logger.warning("Embedding 自检跳过", detail=f"{provider} 未配置 api_key，score>3 的资讯无法向量化")
         return True
 
     embedder = Embedder(settings)
@@ -427,17 +459,33 @@ async def _selftest_embedding(settings: Settings) -> bool:
         vec = await embedder.embed_one("央行宣布下调存款准备金率 0.5 个百分点")
     except DimensionMismatch as exc:
         real_dim = await _probe_embedding_dim(embedder)
-        print(f"  [FAIL] {exc}")
+        logger.error(
+            "Embedding 自检失败",
+            detail=str(exc),
+            expected_dim=settings.embedding_dim,
+            real_dim=real_dim,
+        )
         if real_dim:
-            print(f"         模型 {model} 实际输出 {real_dim} 维 -> 请设置 EMBEDDING_DIM={real_dim} 并执行迁移")
+            logger.error(
+                "维度不匹配",
+                model=model,
+                real_dim=real_dim,
+                hint=f"请设置 EMBEDDING_DIM={real_dim} 并执行迁移",
+            )
         return False
     except Exception as exc:  # noqa: BLE001
-        print(f"  [FAIL] 调用失败：{type(exc).__name__} -> {str(exc)[:200]}")
+        logger.error("Embedding 自检失败", detail=f"{type(exc).__name__} -> {str(exc)[:200]}")
         return False
 
     latency_ms = int((time.perf_counter() - started) * 1000)
     actual_dim = len(vec)
-    print(f"  [OK] provider={provider} model={model} dim={actual_dim} 延迟={latency_ms}ms")
+    logger.info(
+        "Embedding 自检通过",
+        provider=provider,
+        model=model,
+        dim=actual_dim,
+        latency_ms=latency_ms,
+    )
 
     # 与数据库列类型 / 维度 / 索引一致性校验（这三项不一致会在入库或建索引时才炸）
     return await _check_vector_column(vec)
@@ -464,10 +512,11 @@ async def _check_vector_column(vec: list[float]) -> bool:  # noqa: C901
 
     from fin_news.core.db import get_session_factory, init_db
 
+    logger = get_logger(_LOG_NAME)
     try:
         await init_db()
     except Exception as exc:  # noqa: BLE001
-        print(f"  [WARN] 数据库不可用，跳过向量列校验：{str(exc)[:150]}")
+        logger.warning("数据库不可用，跳过向量列校验", detail=str(exc)[:150])
         return True
 
     ok = True
@@ -489,41 +538,44 @@ async def _check_vector_column(vec: list[float]) -> bool:  # noqa: C901
         ).scalar() or ""
 
     if not col_type:
-        print("  [WARN] 未找到 news_chunk.embedding 列，请先执行 alembic upgrade head")
+        logger.warning("未找到 news_chunk.embedding 列", detail="请先执行 alembic upgrade head")
         return True
 
     m = re.match(r"^(halfvec|vector)\((\d+)\)$", str(col_type))
     if not m:
-        print(f"  [FAIL] 列类型异常：{col_type}（应为 vector(n) 或 halfvec(n)）")
+        logger.error("列类型异常", col_type=str(col_type), detail="应为 vector(n) 或 halfvec(n)")
         return False
     type_name, col_dim = m.group(1), int(m.group(2))
     actual_dim = len(vec)
-    print(f"  数据库列：news_chunk.embedding = {col_type}")
+    logger.info("数据库向量列", column=f"news_chunk.embedding = {col_type}")
 
     if col_dim != actual_dim:
         ok = False
-        print(
-            f"  [FAIL] 列维度 {col_dim} != 模型输出 {actual_dim}："
-            + f"需改列类型并重建索引（EMBEDDING_DIM={actual_dim}）"
+        logger.error(
+            "列维度不匹配",
+            col_dim=col_dim,
+            actual_dim=actual_dim,
+            hint=f"需改列类型并重建索引（EMBEDDING_DIM={actual_dim}）",
         )
     # pgvector 索引上限：float vector 最多 2000 维，halfvec 可到 4000 维
     if type_name == "vector" and actual_dim > 2000:
         ok = False
-        print(
-            f"  [FAIL] {actual_dim} 维超过 float vector 的索引上限（2000）："
-            + f"列类型需改为 halfvec({actual_dim})，索引算子改为 halfvec_cosine_ops"
+        logger.error(
+            "float vector 维度过高",
+            actual_dim=actual_dim,
+            hint=f"列类型需改为 halfvec({actual_dim})，索引算子改为 halfvec_cosine_ops",
         )
     if indexdef:
         expect_ops = f"{type_name}_cosine_ops"
         if "hnsw" not in indexdef:
-            print(f"  [WARN] 未使用 HNSW 索引：{indexdef}")
+            logger.warning("未使用 HNSW 索引", indexdef=indexdef)
         elif expect_ops not in indexdef:
             ok = False
-            print(f"  [FAIL] 索引算子与列类型不匹配，应为 {expect_ops}：{indexdef}")
+            logger.error("索引算子不匹配", expected=expect_ops, indexdef=indexdef)
         else:
-            print(f"  [OK] 索引算子匹配：{expect_ops}")
+            logger.info("索引算子匹配", ops=expect_ops)
     else:
-        print("  [WARN] 未找到 idx_chunk_embedding 索引")
+        logger.warning("未找到 idx_chunk_embedding 索引")
 
     # 端到端探针：写入 + 检索（事务回滚，不落库）
     async with factory() as session:
@@ -532,7 +584,7 @@ async def _check_vector_column(vec: list[float]) -> bool:  # noqa: C901
                 await session.execute(text("SELECT id FROM news_item ORDER BY id LIMIT 1"))
             ).scalar()
             if news_id is None:
-                print("  [SKIP] 库内暂无资讯，跳过写入+检索探针")
+                logger.warning("库内暂无资讯，跳过写入+检索探针")
                 return ok
             literal = "[" + ",".join(f"{x:.6f}" for x in vec) + "]"
             await session.execute(
@@ -554,21 +606,21 @@ async def _check_vector_column(vec: list[float]) -> bool:  # noqa: C901
             ).scalar()
             sim_f = float(sim) if sim is not None else float("nan")
             probe_ok = abs(sim_f - 1.0) < 1e-3
-            print(
-                f"  [{'OK' if probe_ok else 'FAIL'}] 写入+检索探针：自身相似度={sim_f:.4f}"
-                + "（预期 1.0，事务已回滚）"
-            )
-            if not probe_ok:
+            if probe_ok:
+                logger.info("写入+检索探针通过", similarity=round(sim_f, 4))
+            else:
+                logger.error("写入+检索探针失败", similarity=round(sim_f, 4), expected=1.0)
                 ok = False
         except Exception as exc:  # noqa: BLE001
             ok = False
-            print(f"  [FAIL] 写入+检索探针失败：{type(exc).__name__} -> {str(exc)[:200]}")
+            logger.error("写入+检索探针异常", detail=f"{type(exc).__name__} -> {str(exc)[:200]}")
         finally:
             await session.rollback()
     return ok
 
 
 async def _dispatch(args: argparse.Namespace) -> int:
+    logger = get_logger(_LOG_NAME)
     if args.command == "ingest":
         return await _cmd_ingest()
     if args.command == "pipeline":
@@ -589,12 +641,12 @@ async def _dispatch(args: argparse.Namespace) -> int:
         return await _cmd_status()
     if args.command == "selftest":
         return await _cmd_selftest()
-    print(__doc__)
+    logger.info("未知命令，打印用法", command=args.command)
+    logger.info(__doc__)
     return 1
 
 
 def main() -> None:
-    configure_logging()
     parser = argparse.ArgumentParser(description="fin-news-v5 命令行工具")
     parser.add_argument(
         "command",
@@ -617,7 +669,17 @@ def main() -> None:
     parser.add_argument(
         "--apply", action="store_true", help="sweep：实际执行修正（默认只扫描不修改）"
     )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="count",
+        default=0,
+        help="增加日志详细程度：-v=DEBUG，-vv=DEBUG 并放开第三方库日志",
+    )
     args = parser.parse_args()
+
+    # 先按 verbosity 配置日志，再执行命令（保证 -v/-vv 对命令内日志生效）
+    configure_logging(verbosity=getattr(args, "verbose", 0) or 0)
     sys.exit(asyncio.run(_dispatch(args)))
 
 
