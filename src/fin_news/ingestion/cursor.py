@@ -24,11 +24,15 @@ class CursorManager:
         kind: IngestKind = IngestKind.NEWS,
         overlap_seconds: int = 300,
     ) -> IngestCursor:
-        """取位点（加行锁，防止多实例并发拉取同一源）。"""
+        """取位点（加行锁，防止多实例并发拉取同一源）。
+
+        用 ``nowait`` 快速失败：上游 ``run_all`` 已用 advisory lock 串行化，
+        此处的行锁只是兜底，避免异常情况下无限等待。
+        """
         result = await self.session.execute(
             select(IngestCursor)
             .where(IngestCursor.source_key == source_key)
-            .with_for_update()
+            .with_for_update(nowait=True)
             .limit(1)
         )
         cursor = result.scalars().first()

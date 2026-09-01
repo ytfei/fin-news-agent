@@ -172,12 +172,21 @@ async def _persist_brief(
 
     data = output.data or {}
     extras = data.get("extras") or {}
+    verdict = extras.get("verdict") or {}
+    one_liner = str(verdict.get("one_liner") or "").strip()
+
+    # 标题 / 摘要兜底：模型未输出 headline/summary 时，降级用 verdict.one_liner，
+    # 再不行才用「日期 + 场次」占位，避免列表页出现空摘要
+    headline = str(data.get("headline") or "").strip()
+    title = headline or one_liner or f"{trade_date.isoformat()} {period.value}"
+    summary = str(data.get("summary") or "").strip() or one_liner
+
     report = AnalysisReport(
         agent_type=agent_type,
         trade_date=trade_date,
         period=period,
-        title=str(data.get("headline") or f"{trade_date.isoformat()} {period.value}")[:255],
-        summary=str(data.get("summary") or "")[:2000],
+        title=title[:255],
+        summary=summary[:2000],
         content=data,
         sentiment=data.get("sentiment") or "neutral",
         impact_level=data.get("impact_level") or "medium",

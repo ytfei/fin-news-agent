@@ -8,7 +8,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from fin_news.api.errors import register_exception_handlers
-from fin_news.api.routers import admin, analysis, chat, discovery, market, news, system
+from fin_news.api.routers import admin, analysis, chat, discovery, evaluation, market, news, system
 from fin_news.core.config import Settings, get_settings
 from fin_news.core.db import dispose_engine, init_db
 from fin_news.core.logging import configure_logging, get_logger
@@ -80,6 +80,7 @@ def create_app(settings: Settings | None = None, with_background: bool = True) -
     app.include_router(market.router, prefix=prefix)
     app.include_router(chat.router, prefix=prefix)
     app.include_router(admin.router, prefix=prefix)
+    app.include_router(evaluation.router, prefix=prefix)
     app.include_router(system.router, prefix=prefix)
     return app
 

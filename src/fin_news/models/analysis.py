@@ -48,7 +48,12 @@ class AnalysisReport(Base, PublicIdMixin, TimestampMixin):
             "period",
             "prompt_version",
             unique=True,
-            postgresql_where="period IN ('pre_market','post_market')",
+            # status 过滤是关键：简报重跑时旧报告先被标为 SUPERSEDED，
+            # 若不加 status 条件，SUPERSEDED 的旧记录仍占据唯一索引，导致新简报插入失败
+            postgresql_where=(
+                "period IN ('pre_market','post_market')"
+                " AND status IN ('DRAFT','PUBLISHED','DEGRADED')"
+            ),
         ),
         Index("idx_report_pub", "published_at"),
         Index("idx_report_type_time", "agent_type", "published_at"),

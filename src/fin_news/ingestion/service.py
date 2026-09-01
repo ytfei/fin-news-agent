@@ -4,6 +4,7 @@ from __future__ import annotations
 import time
 from datetime import datetime, timedelta
 
+from sqlalchemy import text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -27,6 +28,11 @@ from fin_news.models.news import NewsItem
 logger = get_logger("ingestion.service")
 
 MAX_WINDOW = timedelta(hours=24)
+
+# 接入全局互斥锁：PostgreSQL advisory lock 的 key（由字符串稳定派生）。
+# 后台调度（APScheduler）与手动 `cli ingest` 可能并发，两者都会对 IngestCursor
+# 做 `SELECT ... FOR UPDATE`，若不串行化会在行锁上互相阻塞数分钟。
+_ADVISORY_LOCK_KEY = "fin_news:ingest"
 
 
 def _elapsed_ms(started: float) -> int:
@@ -54,17 +60,41 @@ class IngestionService:
             lookback_hours=self.settings.ingest_first_lookback_hours,
             overlap_seconds=self.settings.ingest_overlap_seconds,
         )
-        results: list[IngestResult] = []
-        for source in self.sources:
-            try:
-                results.append(await self.run_source(source))
-            except Exception as exc:  # noqa: BLE001 - 单源失败不影响其他源
-                logger.exception("数据源运行异常", source_key=source.source_key, error=str(exc))
-                results.append(
-                    IngestResult(
-                        source_key=source.source_key, status="FAILED", message=str(exc)[:500]
-                    )
+
+        # 全局互斥：拿不到 advisory lock 说明有另一实例（后台调度/手动 CLI）正在接入，
+        # 本轮直接跳过，避免在 IngestCursor 的 FOR UPDATE 行锁上互相长时间阻塞。
+        async with session_scope() as lock_session:
+            got_lock = (
+                await lock_session.execute(
+                    text("SELECT pg_try_advisory_lock(hashtextextended(:key, 0))"),
+                    {"key": _ADVISORY_LOCK_KEY},
                 )
+            ).scalar()
+            if not got_lock:
+                logger.warning(
+                    "另一接入实例正在运行，跳过本轮",
+                    lock_key=_ADVISORY_LOCK_KEY,
+                )
+                return []
+
+            try:
+                results: list[IngestResult] = []
+                for source in self.sources:
+                    try:
+                        results.append(await self.run_source(source))
+                    except Exception as exc:  # noqa: BLE001 - 单源失败不影响其他源
+                        logger.exception("数据源运行异常", source_key=source.source_key, error=str(exc))
+                        results.append(
+                            IngestResult(
+                                source_key=source.source_key, status="FAILED", message=str(exc)[:500]
+                            )
+                        )
+            finally:
+                await lock_session.execute(
+                    text("SELECT pg_advisory_unlock(hashtextextended(:key, 0))"),
+                    {"key": _ADVISORY_LOCK_KEY},
+                )
+
         logger.info(
             "增量接入结束",
             sources=len(results),

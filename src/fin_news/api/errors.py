@@ -25,6 +25,11 @@ class NotFoundError(AppError):
         super().__init__(status.HTTP_404_NOT_FOUND, detail, "资源不存在")
 
 
+class BadRequestError(AppError):
+    def __init__(self, detail: str = "请求参数错误") -> None:
+        super().__init__(status.HTTP_400_BAD_REQUEST, detail, "参数错误")
+
+
 class ServiceUnavailableError(AppError):
     def __init__(self, detail: str = "依赖服务不可用") -> None:
         super().__init__(status.HTTP_503_SERVICE_UNAVAILABLE, detail, "服务不可用")

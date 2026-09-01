@@ -96,7 +96,7 @@ class Settings(BaseSettings):
     tushare_timeout: int = 30
     tushare_qps: float = 3.0
     news_sources: Annotated[list[str], NoDecode] = Field(
-        default_factory=lambda: ["cls", "wallstreetcn"]
+        default_factory=lambda: ["cls", "wallstreetcn", "yicai"]
     )
 
     # ---------------- 接入调度 ----------------

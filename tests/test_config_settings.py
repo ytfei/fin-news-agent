@@ -35,9 +35,10 @@ def test_settings_accepts_shell_mangled_env(monkeypatch):
     assert s.cors_origins == ["*"]
 
 
-def test_settings_defaults():
+def test_settings_defaults(monkeypatch):
+    monkeypatch.delenv("NEWS_SOURCES", raising=False)
     s = Settings(_env_file=None)
-    assert s.news_sources == ["cls", "wallstreetcn"]
+    assert s.news_sources == ["cls", "wallstreetcn", "yicai"]
     assert s.score_threshold_vectorize == 3
 
 

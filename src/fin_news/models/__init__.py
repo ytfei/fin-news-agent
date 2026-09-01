@@ -16,6 +16,7 @@ from fin_news.models.analysis import (
 )
 from fin_news.models.base import Base
 from fin_news.models.chat import ChatMessage, ChatSession
+from fin_news.models.evaluation import ScoreEvalLabel, ScoreEvalSet
 from fin_news.models.event import (
     AgentRun,
     DeadLetter,
@@ -53,4 +54,6 @@ __all__ = [
     "TradeCalendar",
     "ChatSession",
     "ChatMessage",
+    "ScoreEvalSet",
+    "ScoreEvalLabel",
 ]

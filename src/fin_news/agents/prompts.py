@@ -196,7 +196,7 @@ STOCK_USER_TEMPLATE = MACRO_USER_TEMPLATE
 
 # ============================== 盘前 ==============================
 
-PRE_MARKET_VERSION = "pre_market.v1"
+PRE_MARKET_VERSION = "pre_market.v2"
 
 PRE_MARKET_SYSTEM = f"""你是 A 股盘前策略分析师。服务对象是开盘前想知道"今天怎么看"的个人投资者。
 
@@ -214,6 +214,11 @@ PRE_MARKET_SYSTEM = f"""你是 A 股盘前策略分析师。服务对象是开�
 PRE_MARKET_USER_TEMPLATE = """## 交易日
 
 {trade_date}（A 股开盘前）
+
+## 输出要求（顶层字段，必填）
+
+- headline：一句话展望（20 字内，如"外盘承压，关注低估值防守与政策对冲方向"）
+- summary：2-3 句摘要，供列表页直接展示（隔夜要点 + 今日大概率状态 + 关注方向）
 
 ## 隔夜美股
 
@@ -237,7 +242,7 @@ PRE_MARKET_USER_TEMPLATE = """## 交易日
 
 # ============================== 盘后 ==============================
 
-POST_MARKET_VERSION = "post_market.v1"
+POST_MARKET_VERSION = "post_market.v2"
 
 POST_MARKET_SYSTEM = f"""你是 A 股盘后复盘分析师。核心任务是回答：**今天到底为什么涨 / 为什么跌 / 为什么只是震荡？**
 
@@ -257,6 +262,11 @@ POST_MARKET_SYSTEM = f"""你是 A 股盘后复盘分析师。核心任务是回�
 POST_MARKET_USER_TEMPLATE = """## 交易日
 
 {trade_date}（收盘后）
+
+## 输出要求（顶层字段，必填）
+
+- headline：一句话定调（20 字内概括今日，如"利率冲击压制成长，避险资金轮动低位板块"）
+- summary：2-3 句复盘摘要，供列表页直接展示（说明今日状态 + 主因 + 明日看点）
 
 ## 当日市场数据
 
