@@ -8,16 +8,20 @@
     uv run python -m fin_news.cli premarket        # 生成盘前简报
     uv run python -m fin_news.cli postmarket       # 生成盘后简报
     uv run python -m fin_news.cli status           # 查看积压与统计
-    uv run python -m fin_news.cli selftest         # 数据源连通性自检
+    uv run python -m fin_news.cli selftest         # 数据源 / LLM / Embedding 连通性自检
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
 import sys
+from typing import TYPE_CHECKING
 
-from fin_news.core.config import get_settings
+from fin_news.core.config import Settings, get_settings
 from fin_news.core.logging import configure_logging, get_logger
+
+if TYPE_CHECKING:
+    from fin_news.agents.embeddings import Embedder
 
 logger = get_logger("cli")
 
@@ -102,40 +106,269 @@ async def _cmd_status() -> int:
 
 
 async def _cmd_selftest() -> int:
-    """数据源与模型连通性自检。"""
-    from fin_news.ingestion.tushare_client import TusharePermissionError, get_tushare_client
-
+    """数据源 / LLM / Embedding 连通性自检。"""
     settings = get_settings()
     print(f"数据源：{settings.news_sources}")
     print(f"LLM 凭据：{'已配置' if settings.has_llm_credentials() else '未配置（分析链路将跳过）'}")
 
-    try:
-        client = get_tushare_client(settings)
-    except ValueError as exc:
-        print(f"Tushare 自检失败：{exc}")
-        return 1
+    source_ok = await _selftest_sources(settings)
+    llm_ok = await _selftest_llm(settings)
+    embed_ok = await _selftest_embedding(settings)
 
+    all_ok = source_ok and llm_ok and embed_ok
+    print("\n自检结果：" + ("全部通过" if all_ok else "存在问题，见上方 [FAIL]/[WARN] 项"))
+    return 0 if all_ok else 1
+
+
+async def _selftest_sources(settings: Settings) -> bool:
+    """Tushare 资讯源连通性。"""
     from datetime import timedelta
 
     from fin_news.core.timeutil import now
     from fin_news.ingestion.sources.tushare_news import TushareNewsSource
+    from fin_news.ingestion.tushare_client import TusharePermissionError, get_tushare_client
+
+    print("\n数据源自检：")
+    try:
+        client = get_tushare_client(settings)
+    except ValueError as exc:
+        print(f"  [FAIL] Tushare 客户端初始化失败：{exc}")
+        return False
 
     ok = True
     for src in settings.news_sources:
         source = TushareNewsSource(src, client=client, settings=settings)
         try:
             items = await source.fetch(now() - timedelta(hours=3), now())
-            print(f"  {src}: OK, 近 3 小时 {len(items)} 条")
+            print(f"  [OK] {src}: 近 3 小时 {len(items)} 条")
             if items:
                 sample = items[0]
-                print(f"    样例标题：{sample.title}")
+                print(f"       样例标题：{sample.title or '(无标题，接入时会兜底)'}")
         except TusharePermissionError as exc:
             ok = False
-            print(f"  {src}: 无权限 -> {exc}")
+            print(f"  [FAIL] {src}: 无权限 -> {exc}")
         except Exception as exc:  # noqa: BLE001
             ok = False
-            print(f"  {src}: 失败 -> {str(exc)[:200]}")
-    return 0 if ok else 1
+            print(f"  [FAIL] {src}: {type(exc).__name__} -> {str(exc)[:200]}")
+    return ok
+
+
+async def _selftest_llm(settings: Settings) -> bool:
+    """逐个角色做一次最小调用，验证模型可用 + JSON 结构化输出 + 是否走了降级。"""
+    from fin_news.agents.llm.client import LLMUnavailable, get_llm_client
+
+    print("\nLLM 自检（每个角色一次最小调用，验证 JSON 结构化输出）：")
+    if not settings.has_llm_credentials():
+        print("  [SKIP] 未配置任何模型 API Key，评分 / 分析 / 追问链路会跳过")
+        return True
+
+    client = get_llm_client(settings)
+    ok = True
+    degraded_roles: list[str] = []
+
+    for role in ("scoring", "analysis", "qa"):
+        try:
+            resp = await client.chat(
+                role=role,  # type: ignore[arg-type]
+                system="你是连通性自检程序。",
+                user='只输出 JSON：{"ok": true}',
+                json_mode=True,
+                temperature=0,
+                max_tokens=32,
+            )
+        except LLMUnavailable as exc:
+            ok = False
+            print(f"  [FAIL] {role}: 主备模型均不可用 -> {str(exc)[:200]}")
+            continue
+        except Exception as exc:  # noqa: BLE001
+            ok = False
+            print(f"  [FAIL] {role}: {type(exc).__name__} -> {str(exc)[:200]}")
+            continue
+
+        structured = resp.data is not None
+        if resp.is_fallback:
+            degraded_roles.append(role)
+        flag = "OK" if structured else "WARN"
+        if not structured:
+            ok = False
+        print(
+            f"  [{flag}] {role}: provider={resp.provider} model={resp.model}"
+            f"{' (降级到备 provider)' if resp.is_fallback else ''}"
+            f" 延迟={resp.latency_ms}ms tokens={resp.prompt_tokens}+{resp.completion_tokens}"
+            f" 结构化输出={'正常' if structured else '解析失败 -> ' + (resp.content or '')[:60]}"
+        )
+
+    if degraded_roles:
+        # 主 provider 模型不可用（常见原因：模型名不存在 / 无权限），全链路都在走备 provider
+        print(
+            f"  [WARN] {', '.join(degraded_roles)} 走了备 provider，"
+            f"请检查 {settings.llm_default_provider} 的模型名是否为账号下真实存在的模型 ID"
+        )
+    return ok
+
+
+async def _selftest_embedding(settings: Settings) -> bool:
+    """验证 embedding 可用、维度与配置一致、且与数据库列类型 / 索引兼容。"""
+    import time
+
+    from fin_news.agents.embeddings import DimensionMismatch, Embedder
+
+    print("\nEmbedding 自检：")
+    provider = settings.embedding_provider
+    model = settings.model_for(provider, "embedding")  # type: ignore[arg-type]
+    cfg = settings.provider(provider)  # type: ignore[arg-type]
+    if not cfg.api_key:
+        print(f"  [SKIP] {provider} 未配置 api_key，score>3 的资讯无法向量化（检索与历史分析会失效）")
+        return True
+
+    embedder = Embedder(settings)
+    started = time.perf_counter()
+    try:
+        vec = await embedder.embed_one("央行宣布下调存款准备金率 0.5 个百分点")
+    except DimensionMismatch as exc:
+        real_dim = await _probe_embedding_dim(embedder)
+        print(f"  [FAIL] {exc}")
+        if real_dim:
+            print(f"         模型 {model} 实际输出 {real_dim} 维 -> 请设置 EMBEDDING_DIM={real_dim} 并执行迁移")
+        return False
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [FAIL] 调用失败：{type(exc).__name__} -> {str(exc)[:200]}")
+        return False
+
+    latency_ms = int((time.perf_counter() - started) * 1000)
+    actual_dim = len(vec)
+    print(f"  [OK] provider={provider} model={model} dim={actual_dim} 延迟={latency_ms}ms")
+
+    # 与数据库列类型 / 维度 / 索引一致性校验（这三项不一致会在入库或建索引时才炸）
+    return await _check_vector_column(vec)
+
+
+async def _probe_embedding_dim(embedder: Embedder) -> int | None:
+    """绕过维度校验，取模型真实输出维度（用于报错时给出正确的 EMBEDDING_DIM 取值）。"""
+    try:
+        settings = embedder.settings
+        resp = await embedder.client.embeddings.create(
+            model=settings.model_for(settings.embedding_provider, "embedding"),
+            input=["维度探测"],
+        )
+        return len(resp.data[0].embedding)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+async def _check_vector_column(vec: list[float]) -> bool:  # noqa: C901
+    """校验 news_chunk.embedding 的列类型、维度、索引与实际向量是否匹配。
+
+    同时做一次「写入 + 相似度检索」探针（放在事务里，最后回滚，不留脏数据）。
+    """
+    import re
+
+    from sqlalchemy import text
+
+    from fin_news.core.db import get_session_factory, init_db
+
+    try:
+        await init_db()
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [WARN] 数据库不可用，跳过向量列校验：{str(exc)[:150]}")
+        return True
+
+    ok = True
+    factory = get_session_factory()
+
+    async with factory() as session:
+        col_type = (
+            await session.execute(
+                text(
+                    "SELECT format_type(a.atttypid, a.atttypmod) FROM pg_attribute a "
+                    "WHERE a.attrelid = 'news_chunk'::regclass AND a.attname = 'embedding' AND a.attnum > 0"
+                )
+            )
+        ).scalar()
+        indexdef = (
+            await session.execute(
+                text("SELECT indexdef FROM pg_indexes WHERE indexname = 'idx_chunk_embedding'")
+            )
+        ).scalar() or ""
+
+    if not col_type:
+        print("  [WARN] 未找到 news_chunk.embedding 列，请先执行 alembic upgrade head")
+        return True
+
+    m = re.match(r"^(halfvec|vector)\((\d+)\)$", str(col_type))
+    if not m:
+        print(f"  [FAIL] 列类型异常：{col_type}（应为 vector(n) 或 halfvec(n)）")
+        return False
+    type_name, col_dim = m.group(1), int(m.group(2))
+    actual_dim = len(vec)
+    print(f"  数据库列：news_chunk.embedding = {col_type}")
+
+    if col_dim != actual_dim:
+        ok = False
+        print(
+            f"  [FAIL] 列维度 {col_dim} != 模型输出 {actual_dim}："
+            f"需改列类型并重建索引（EMBEDDING_DIM={actual_dim}）"
+        )
+    # pgvector 索引上限：float vector 最多 2000 维，halfvec 可到 4000 维
+    if type_name == "vector" and actual_dim > 2000:
+        ok = False
+        print(
+            f"  [FAIL] {actual_dim} 维超过 float vector 的索引上限（2000）："
+            f"列类型需改为 halfvec({actual_dim})，索引算子改为 halfvec_cosine_ops"
+        )
+    if indexdef:
+        expect_ops = f"{type_name}_cosine_ops"
+        if "hnsw" not in indexdef:
+            print(f"  [WARN] 未使用 HNSW 索引：{indexdef}")
+        elif expect_ops not in indexdef:
+            ok = False
+            print(f"  [FAIL] 索引算子与列类型不匹配，应为 {expect_ops}：{indexdef}")
+        else:
+            print(f"  [OK] 索引算子匹配：{expect_ops}")
+    else:
+        print("  [WARN] 未找到 idx_chunk_embedding 索引")
+
+    # 端到端探针：写入 + 检索（事务回滚，不落库）
+    async with factory() as session:
+        try:
+            news_id = (
+                await session.execute(text("SELECT id FROM news_item ORDER BY id LIMIT 1"))
+            ).scalar()
+            if news_id is None:
+                print("  [SKIP] 库内暂无资讯，跳过写入+检索探针")
+                return ok
+            literal = "[" + ",".join(f"{x:.6f}" for x in vec) + "]"
+            await session.execute(
+                text(
+                    "INSERT INTO news_chunk (news_id, chunk_index, content, embedding, model) "
+                    f"VALUES (:news_id, 999999, 'selftest-probe', CAST(:vec AS {type_name}), 'selftest') "
+                    "ON CONFLICT (news_id, chunk_index) DO NOTHING"
+                ),
+                {"news_id": news_id, "vec": literal},
+            )
+            sim = (
+                await session.execute(
+                    text(
+                        "SELECT 1 - (embedding <=> CAST(:vec AS " + type_name + ")) "
+                        "FROM news_chunk WHERE chunk_index = 999999 AND model = 'selftest'"
+                    ),
+                    {"vec": literal},
+                )
+            ).scalar()
+            sim_f = float(sim) if sim is not None else float("nan")
+            probe_ok = abs(sim_f - 1.0) < 1e-3
+            print(
+                f"  [{'OK' if probe_ok else 'FAIL'}] 写入+检索探针：自身相似度={sim_f:.4f}"
+                f"（预期 1.0，事务已回滚）"
+            )
+            if not probe_ok:
+                ok = False
+        except Exception as exc:  # noqa: BLE001
+            ok = False
+            print(f"  [FAIL] 写入+检索探针失败：{type(exc).__name__} -> {str(exc)[:200]}")
+        finally:
+            await session.rollback()
+    return ok
 
 
 async def _dispatch(args: argparse.Namespace) -> int:

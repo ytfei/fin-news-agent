@@ -21,9 +21,22 @@
 | REST API | `/health`、`/news`、`/news/{id}`、`/analysis`、`/market/*`、`/chat/sessions`、`/admin/*` 均正常 |
 | 单元测试 `pytest` | 50 passed |
 | 静态检查 `ruff` | All checks passed |
-| **评分 / 向量化 / 深度分析** | 已接线但**未实跑**——需要配置 `VOLCENGINE_API_KEY` 或 `DEEPSEEK_API_KEY`（含 Embedding） |
+| **评分** | 已实跑：火山 `doubao-seed-2-0-mini` 批量打分，30 条/批约 12–45s |
+| **向量化** | 已实跑：`doubao-embedding-text-240715`，2560 维，列类型 `halfvec(2560)` + HNSW |
+| **深度分析** | 已实跑：个股 / 行业 Agent 产出结构化报告（含受益板块、龙头、估值、逻辑链） |
+| **语义检索** | 已验证：同事件跨源相似度 0.92，无关资讯 0.70 |
 
-> 追问接口在无 Key 时会返回 `503 + "分析服务暂时不可用"`，这是设计行为，不是故障。
+```bash
+uv run python -m fin_news.cli selftest   # 一条命令验收数据源 / LLM / Embedding / 向量列
+```
+
+> 未配置模型 Key 时，追问接口返回 `503 + "分析服务暂时不可用"`，评分/分析事件会放回队列等待，不会进死信。
+
+### 已知缺口
+
+- **行情/估值数据未接入**：`stock_daily` / `daily_basic` / `us_daily` 等表为空，
+  行业 Agent 输出里的 `pe_ttm` / `pb` / 分位数目前是 `null`；盘前盘后 Agent 也只能做定性分析。
+  这是下一步要补的「市场数据同步任务」。
 
 ---
 
