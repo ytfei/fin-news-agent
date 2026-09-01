@@ -1,0 +1,70 @@
+[project]
+name = "fin-news-v5"
+version = "0.1.0"
+description = "财经资讯分析 Agent：解释市场为什么涨跌，并支持持续追问"
+readme = "README.md"
+requires-python = ">=3.11"
+
+dependencies = [
+    # --- web / api ---
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    "python-dotenv>=1.0",
+    # --- storage ---
+    "sqlalchemy[asyncio]>=2.0.30",
+    "asyncpg>=0.29",
+    "alembic>=1.13",
+    "pgvector>=0.3",
+    # --- scheduling ---
+    "apscheduler>=3.10",
+    # --- data source ---
+    "tushare>=1.4.21",
+    "pandas>=2.0",
+    # --- llm / agent ---
+    "openai>=1.40",
+    "langchain-openai>=0.2",
+    "langgraph>=0.2",
+    "deepagents>=0.7",
+    # --- utils ---
+    "httpx>=0.27",
+    "tenacity>=9.0",
+    "structlog>=24.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.6",
+]
+
+[project.scripts]
+fin-news = "fin_news.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/fin_news"]
+
+[tool.uv]
+package = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["B008", "E501"]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true

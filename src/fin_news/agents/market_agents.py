@@ -1,0 +1,203 @@
+"""盘前 / 盘后 Agent：定时生成当日展望与复盘（回答「今天为什么涨跌」）。"""
+from __future__ import annotations
+
+import json
+from datetime import date, datetime, timedelta
+from typing import Any
+
+from sqlalchemy import update
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from fin_news.agents.base import AgentOutput, run_agent
+from fin_news.agents.prompts import (
+    POST_MARKET_SYSTEM,
+    POST_MARKET_USER_TEMPLATE,
+    POST_MARKET_VERSION,
+    PRE_MARKET_SYSTEM,
+    PRE_MARKET_USER_TEMPLATE,
+    PRE_MARKET_VERSION,
+)
+from fin_news.agents.tools.langchain_tools import build_toolset
+from fin_news.agents.tools.market_data import (
+    high_score_news,
+    is_trading_day,
+    latest_trade_date,
+    market_snapshot,
+    top_list_of_day,
+    us_overnight,
+)
+from fin_news.agents.tools.retrieval import format_hits, history_search
+from fin_news.core.config import Settings, get_settings
+from fin_news.core.db import session_scope
+from fin_news.core.enums import AgentType, MarketPeriod, ReportStatus
+from fin_news.core.logging import get_logger
+from fin_news.core.timeutil import now, now_utc
+from fin_news.models.analysis import AnalysisReport
+
+logger = get_logger("agents.market")
+
+OVERNIGHT_HOURS = 12
+
+
+# ----------------------------------------------------------------------
+async def run_pre_market(trade_date: date | None = None, settings: Settings | None = None):
+    settings = settings or get_settings()
+    day = trade_date or now().date()
+    async with session_scope() as session:
+        if not await is_trading_day(session, day):
+            logger.info("非交易日，跳过盘前任务", trade_date=day.isoformat())
+            return None
+        return await _build_brief(session, day, MarketPeriod.PRE_MARKET, settings)
+
+
+async def run_post_market(trade_date: date | None = None, settings: Settings | None = None):
+    settings = settings or get_settings()
+    day = trade_date or now().date()
+    async with session_scope() as session:
+        if not await is_trading_day(session, day):
+            logger.info("非交易日，跳过盘后任务", trade_date=day.isoformat())
+            return None
+        return await _build_brief(session, day, MarketPeriod.POST_MARKET, settings)
+
+
+# ----------------------------------------------------------------------
+async def _build_brief(
+    session: AsyncSession,
+    trade_date: date,
+    period: MarketPeriod,
+    settings: Settings,
+) -> AnalysisReport | None:
+    if not settings.has_llm_credentials():
+        logger.warning("未配置模型 API Key，跳过简报生成", period=period.value)
+        return None
+
+    agent_type = AgentType.PRE_MARKET if period == MarketPeriod.PRE_MARKET else AgentType.POST_MARKET
+    system_prompt, user_template, version = (
+        (PRE_MARKET_SYSTEM, PRE_MARKET_USER_TEMPLATE, PRE_MARKET_VERSION)
+        if period == MarketPeriod.PRE_MARKET
+        else (POST_MARKET_SYSTEM, POST_MARKET_USER_TEMPLATE, POST_MARKET_VERSION)
+    )
+
+    context = await _build_context(session, trade_date, period, settings)
+    # 内部字段不进模板
+    template_ctx = {k: v for k, v in context.items() if not k.startswith("_")}
+
+    output: AgentOutput = await run_agent(
+        agent_type,
+        system_prompt,
+        user_template.format(**template_ctx),
+        tools=build_toolset(agent_type.value),
+        settings=settings,
+    )
+
+    report = await _persist_brief(session, trade_date, period, agent_type, version, output, context)
+    logger.info(
+        "简报生成完成",
+        period=period.value,
+        trade_date=trade_date.isoformat(),
+        report_id=report.id,
+        degraded=output.degraded,
+        latency_ms=output.latency_ms,
+    )
+    return report
+
+
+async def _build_context(
+    session: AsyncSession, trade_date: date, period: MarketPeriod, settings: Settings
+) -> dict[str, Any]:
+    now_dt = now()
+
+    if period == MarketPeriod.PRE_MARKET:
+        start = now_dt - timedelta(hours=OVERNIGHT_HOURS)
+        end = now_dt
+    else:
+        start = datetime.combine(trade_date, datetime.min.time()).astimezone(now_dt.tzinfo)
+        end = now_dt
+
+    news_items = await high_score_news(session, start, end, min_score=5, limit=20)
+    market = await market_snapshot(session, trade_date)
+    us = await us_overnight(session, trade_date)
+    prev_date = await latest_trade_date(session, before=trade_date - timedelta(days=1))
+    prev_market = await market_snapshot(session, prev_date) if prev_date else {}
+    top_list = await top_list_of_day(session, trade_date, limit=15) if period == MarketPeriod.POST_MARKET else []
+
+    # 历史情境：用当日高评分标题做一次向量检索
+    history_text = "（暂无）"
+    if news_items:
+        try:
+            query = " ".join(n["title"] for n in news_items[:5])
+            hits = await history_search(session, query, top_k=6)
+            history_text = format_hits(hits)[:2500]
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("历史检索失败", error=str(exc)[:200])
+
+    news_text = "\n".join(
+        f"- [id:{n['id']}]（评分{n['score']}）{n['title']}\n  {n.get('score_reason') or ''}"
+        for n in news_items
+    ) or "（今日暂无高评分资讯）"
+
+    return {
+        "trade_date": trade_date.isoformat(),
+        "us_market": json.dumps(us, ensure_ascii=False),
+        "prev_market": json.dumps(prev_market, ensure_ascii=False),
+        "market": json.dumps(market, ensure_ascii=False),
+        "news": news_text,
+        "top_list": json.dumps(top_list, ensure_ascii=False),
+        "history": history_text,
+        "_news_ids": [n["id"] for n in news_items],
+    }
+
+
+async def _persist_brief(
+    session: AsyncSession,
+    trade_date: date,
+    period: MarketPeriod,
+    agent_type: AgentType,
+    version: str,
+    output: AgentOutput,
+    context: dict[str, Any],
+) -> AnalysisReport:
+    await session.execute(
+        update(AnalysisReport)
+        .where(
+            AnalysisReport.trade_date == trade_date,
+            AnalysisReport.period == period,
+            AnalysisReport.prompt_version == version,
+            AnalysisReport.status.in_(
+                [ReportStatus.DRAFT, ReportStatus.PUBLISHED, ReportStatus.DEGRADED]
+            ),
+        )
+        .values(status=ReportStatus.SUPERSEDED)
+    )
+
+    data = output.data or {}
+    extras = data.get("extras") or {}
+    report = AnalysisReport(
+        agent_type=agent_type,
+        trade_date=trade_date,
+        period=period,
+        title=str(data.get("headline") or f"{trade_date.isoformat()} {period.value}")[:255],
+        summary=str(data.get("summary") or "")[:2000],
+        content=data,
+        sentiment=data.get("sentiment") or "neutral",
+        impact_level=data.get("impact_level") or "medium",
+        horizon=data.get("horizon") or "intraday",
+        confidence=float(data.get("confidence", 0.6) or 0.6),
+        beneficiaries=data.get("beneficiaries") or [],
+        victims=data.get("victims") or [],
+        entities=[],
+        references=context.get("_news_ids") or [],
+        external_sources=[],
+        status=ReportStatus.DEGRADED if output.degraded else ReportStatus.PUBLISHED,
+        model=output.model,
+        prompt_version=version,
+        tokens=(output.prompt_tokens or 0) + (output.completion_tokens or 0),
+        latency_ms=output.latency_ms,
+        published_at=now_utc(),
+    )
+    # 盘前/盘后的关键结构化字段提升到顶层，便于 API 直接返回
+    if isinstance(extras, dict) and extras:
+        report.content["extras"] = extras
+    session.add(report)
+    await session.flush()
+    return report

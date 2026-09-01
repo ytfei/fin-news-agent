@@ -48,7 +48,10 @@ A 股散户最真实的需求不是"看新闻"，而是**解释市场**：
   - `major_news`（长篇通讯，需单独开权限）：字段 `title / content / pub_time / src / src_site`，用于宏观政策类深度分析正文。
   - 行情与基本面（分析 Agent 的取数工具）：`daily`、`daily_basic`、`index_daily`、`us_daily`、`stk_forecast`、`top_list`、`top_inst`、`fina_indicator`、`trade_cal`、`stock_basic`、`anns` 等。
 - F1.2 **每分钟**触发一次增量拉取（APScheduler），按 `(source, src)` 维护增量位点（cursor），支持重叠窗口（回看 N 分钟）以容忍数据源延迟。
-- F1.3 归一化 + 去重：统一字段模型，按 `content_hash`（正文规范化后哈希）与 `simhash`（近似去重，汉明距离 ≤ 3）判重；重复资讯更新 `first_seen_at / seen_count`，不重复入库。
+- F1.3 归一化 + 去重：统一字段模型，按 `content_hash`（正文规范化后哈希，忽略标点与空白）与 `simhash` 判重。
+  - 指纹计算前先剥离转载前缀（如 `【财联社9月1日电】`）；
+  - 近似去重阈值经实测校准为**汉明距离 ≤ 10**（标点/前缀差异=0，截断=9，改 2 字=10，无关资讯=25）；
+  - 重复资讯更新 `first_seen_at / seen_count`，不重复入库。
 - F1.4 噪声过滤（规则层，廉价前置）：广告、荐股话术、纯行情速报、"X 股涨停/跌停"无因快讯、转载重复。
 - F1.5 原始数据落库后发出 `news.ingested` 事件。
 
