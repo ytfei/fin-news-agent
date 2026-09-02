@@ -54,7 +54,8 @@ AGENT_SPECS: dict[AgentType, AgentSpec] = {
         framework="deepagents",
         model_role="analysis",
         prompt_version="macro.v2",
-        recursion_limit=12,
+        # 深度 ReAct：LangGraph 按节点计数且子 agent 内部也计步，12 会截断在检索中途
+        recursion_limit=80,
         timeout_seconds=300,
         note="宏观/政策：DeepAgents + 子 agent（历史 / 传导 / 外部并行）",
     ),
@@ -63,7 +64,8 @@ AGENT_SPECS: dict[AgentType, AgentSpec] = {
         framework="deepagents",
         model_role="analysis",
         prompt_version="industry.v2",
-        recursion_limit=12,
+        # 深度 ReAct：LangGraph 按节点计数且子 agent 内部也计步，12 会截断在检索中途
+        recursion_limit=80,
         timeout_seconds=300,
         note="行业/产业：DeepAgents 自主检索 + 估值分析",
     ),
@@ -72,7 +74,8 @@ AGENT_SPECS: dict[AgentType, AgentSpec] = {
         framework="deepagents",
         model_role="analysis",
         prompt_version="stock.v2",
-        recursion_limit=12,
+        # 深度 ReAct：LangGraph 按节点计数且子 agent 内部也计步，12 会截断在检索中途
+        recursion_limit=80,
         timeout_seconds=300,
         note="个股事件：DeepAgents 精简版（估值 + 走势）",
     ),
@@ -80,18 +83,22 @@ AGENT_SPECS: dict[AgentType, AgentSpec] = {
         agent_type=AgentType.PRE_MARKET,
         framework="deepagents",
         model_role="analysis",
-        prompt_version="pre_market.v2",
-        recursion_limit=12,
-        timeout_seconds=300,
+        prompt_version="pre_market.v3",
+        # 深度 ReAct：LangGraph 按节点计数且子 agent 内部也计步，12 会截断在检索中途
+        recursion_limit=80,
+        # 简报走多轮工具 + 外部检索 + 子 agent 并行，预算比逐条资讯分析更宽松
+        timeout_seconds=600,
         note="盘前展望：上下文由 market_agents 预取内联，输出收敛到 AnalysisPayload（us_market / focus_directions 走 extras）",
     ),
     AgentType.POST_MARKET: AgentSpec(
         agent_type=AgentType.POST_MARKET,
         framework="deepagents",
         model_role="analysis",
-        prompt_version="post_market.v2",
-        recursion_limit=12,
-        timeout_seconds=300,
+        prompt_version="post_market.v3",
+        # 深度 ReAct：LangGraph 按节点计数且子 agent 内部也计步，12 会截断在检索中途
+        recursion_limit=80,
+        # 简报走多轮工具 + 外部检索 + 子 agent 并行，预算比逐条资讯分析更宽松
+        timeout_seconds=600,
         note="盘后复盘：同上，attribution 归因与 verdict 定调走 extras",
     ),
     AgentType.QA: AgentSpec(
@@ -157,7 +164,7 @@ def get_agent(agent_type: AgentType, settings: Any | None = None) -> Any:
     if spec.framework == "legacy":
         raise NotImplementedError(
             f"{agent_type.value} 尚未图化：追问依赖 SSE 流式与多轮 RAG" +
-            f"（见 docs/05-agent-refactor-design.md P4），请直接使用 qa_agent.QAAgent"
+            "（见 docs/05-agent-refactor-design.md P4），请直接使用 qa_agent.QAAgent"
         )
 
     if spec.framework == "deepagents":

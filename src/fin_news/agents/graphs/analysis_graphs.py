@@ -120,6 +120,110 @@ def _macro_subagents(settings: Settings) -> list[SubAgent]:
     return subs
 
 
+def _pre_market_subagents(settings: Settings) -> list[SubAgent]:
+    """盘前子 agent：隔夜外盘 / 消息面 / 盘面预判 三路并行。
+
+    us_daily 无权限，隔夜外盘只能靠外部搜索补齐，故 overnight-analyst
+    仅在搜索可用时挂载（与宏观的 external-analyst 同一策略）。
+    """
+    subs: list[SubAgent] = [
+        SubAgent(
+            name="newsflow-analyst",
+            description="检索隔夜高评分资讯，识别真正影响今日开盘的主线与消息强弱。",
+            system_prompt=(
+                "你是消息面分析师。用 history_search 检索隔夜至开盘前的财经资讯，"
+                "剔除重复转载与噪声，归纳出真正影响今日开盘的 3-8 条主线，"
+                "每条标注影响方向（利好/利空）与强度。"
+                "输出精炼的中文要点，供主分析师汇总。"
+            ),
+            tools=[history_search_tool],
+        ),
+        SubAgent(
+            name="positioning-analyst",
+            description="用 market_snapshot / stock_lookup 分析最近收盘状态，预判今日开盘与主线方向。",
+            system_prompt=(
+                "你是盘面预判分析师。用 market_snapshot 获取最近交易日的市场状态"
+                "（指数、涨跌家数、成交额、板块涨跌），必要时用 stock_lookup 查关键权重股，"
+                "判断今日大概率的开盘状态（高开/低开/平开）、可能延续或反转的方向，"
+                "以及需要规避的方向。输出精炼的中文要点，供主分析师汇总。"
+            ),
+            tools=[market_snapshot_tool, stock_lookup_tool],
+        ),
+    ]
+    if settings.web_search_enabled:
+        subs.insert(
+            0,
+            SubAgent(
+                name="overnight-analyst",
+                description="检索隔夜美股、欧股与大宗商品表现，补齐 us_daily 无权限的外盘数据缺口。",
+                system_prompt=(
+                    "你是隔夜外盘分析师。用 web_search 检索隔夜美股三大指数、欧洲主要股指、"
+                    "关键大宗商品（原油、黄金、有色）与中概股表现。"
+                    "只采用可信来源并标注数据时点；检索不到某项要明确说明缺失，禁止编造数值。"
+                    "输出各市场涨跌幅与对 A 股的映射方向，供主分析师汇总。"
+                ),
+                tools=[web_search_tool],
+            ),
+        )
+    return subs
+
+
+def _post_market_subagents(settings: Settings) -> list[SubAgent]:
+    """盘后子 agent：盘面复盘 / 归因 / 次日展望 三路并行。"""
+    subs: list[SubAgent] = [
+        SubAgent(
+            name="tape-analyst",
+            description="用 market_snapshot / stock_lookup 复盘当日涨跌结构、板块轮动与资金去向。",
+            system_prompt=(
+                "你是盘面复盘分析师。用 market_snapshot 获取当日市场快照"
+                "（指数、涨跌家数、成交额、涨停跌停、板块涨跌 TOP/BOTTOM），"
+                "必要时用 stock_lookup 查领涨领跌个股，"
+                "判断今天是普涨、结构市还是普跌，资金在往哪些板块去、从哪些板块撤。"
+                "输出精炼的中文要点，供主分析师汇总。"
+            ),
+            tools=[market_snapshot_tool, stock_lookup_tool],
+        ),
+        SubAgent(
+            name="attribution-analyst",
+            description="用 history_search 把当日资讯与指数波动做归因，每条归因挂上对应 news_id。",
+            system_prompt=(
+                "你是归因分析师。用 history_search 检索当日及近期资讯，"
+                "把当日指数波动拆解成若干条因素，每条给出：因素名、方向（positive/negative）、"
+                "权重（0-1，各条之和约为 1）、对应的 news_id 列表。"
+                "禁止用行情描述充当原因（「指数涨了」是结果不是原因）；"
+                "找不到消息面驱动时明确说明更多是资金与情绪因素，不要硬编归因。"
+                "输出结构化的归因清单，供主分析师汇总。"
+            ),
+            tools=[history_search_tool],
+        ),
+    ]
+    if settings.web_search_enabled:
+        subs.append(
+            SubAgent(
+                name="outlook-analyst",
+                description="用 web_search 检索机构解读、市场预期与海外反应，形成次日关注点。",
+                system_prompt=(
+                    "你是次日展望分析师。用 web_search 检索今日行情的机构解读、"
+                    "市场预期、海外与外盘反应，以及明日可能影响开盘的事件。"
+                    "只保留可信来源并标注信息时点，输出 3-6 条次日关注点，供主分析师汇总。"
+                ),
+                tools=[web_search_tool],
+            ),
+        )
+    return subs
+
+
+def _subagents_for(agent_type: AgentType, settings: Settings) -> list[SubAgent] | None:
+    """按 Agent 类型返回并行子 agent（主 agent 只做汇总）。"""
+    if agent_type == AgentType.MACRO_POLICY:
+        return _macro_subagents(settings)
+    if agent_type == AgentType.PRE_MARKET:
+        return _pre_market_subagents(settings)
+    if agent_type == AgentType.POST_MARKET:
+        return _post_market_subagents(settings)
+    return None
+
+
 # ----------------------------------------------------------------------
 # 图构建与缓存
 # ----------------------------------------------------------------------
@@ -155,7 +259,7 @@ def build_analysis_graph(
     # analysis_agents._run_analysis 在「整图失败」时降级到 legacy 单次调用（带主备降级）。
     model = get_model_factory(settings).chat("analysis", with_fallback=False)
     tools = _main_tools(agent_type, settings)
-    subagents = _macro_subagents(settings) if agent_type == AgentType.MACRO_POLICY else None
+    subagents = _subagents_for(agent_type, settings)
 
     rf = response_format if response_format is not None else _response_format_for(settings)
     return create_deep_agent(
@@ -168,15 +272,50 @@ def build_analysis_graph(
     )
 
 
-def _main_tools(agent_type: AgentType, settings: Settings) -> list[Any]:
-    """主 agent 的工具集。
+# 主 agent 工具集：声明式映射（新增 Agent 只改这张表，不再加特判分支）
+MAIN_TOOLS: dict[AgentType, tuple[Any, ...]] = {
+    # 宏观：需要外部信息（市场预期 / 海外反应）
+    AgentType.MACRO_POLICY: (
+        history_search_tool,
+        web_search_tool,
+        stock_lookup_tool,
+        market_snapshot_tool,
+    ),
+    AgentType.INDUSTRY: (history_search_tool, stock_lookup_tool, market_snapshot_tool),
+    AgentType.STOCK: (history_search_tool, stock_lookup_tool, market_snapshot_tool),
+    # 盘前：隔夜外盘（us_daily 无权限，靠外部搜索补齐）
+    AgentType.PRE_MARKET: (
+        history_search_tool,
+        web_search_tool,
+        stock_lookup_tool,
+        market_snapshot_tool,
+    ),
+    # 盘后：机构解读与次日预期
+    AgentType.POST_MARKET: (
+        history_search_tool,
+        web_search_tool,
+        stock_lookup_tool,
+        market_snapshot_tool,
+    ),
+}
 
-    历史检索 / 个股估值 / 市场快照都交给 Agent 按需调用（不再预取塞进 prompt），
-    宏观额外开放 web_search。与旧版 build_toolset 保持一致，但去掉预取重复。
+_DEFAULT_MAIN_TOOLS: tuple[Any, ...] = (
+    history_search_tool,
+    stock_lookup_tool,
+    market_snapshot_tool,
+)
+
+
+def _main_tools(agent_type: AgentType, settings: Settings) -> list[Any]:
+    """主 agent 的工具集（声明式映射 + 按可用性过滤）。
+
+    历史检索 / 个股估值 / 市场快照都交给 Agent 按需调用（不再预取塞进 prompt）。
+    外部搜索仅对声明了它的 Agent 开放，且未配置搜索服务时自动剔除——避免
+    ReAct 循环里白调一个必定返回「不可用」的工具，白白消耗步数预算。
     """
-    tools: list[Any] = [history_search_tool, stock_lookup_tool, market_snapshot_tool]
-    if agent_type == AgentType.MACRO_POLICY and settings.web_search_enabled:
-        tools.insert(1, web_search_tool)
+    tools = list(MAIN_TOOLS.get(agent_type, _DEFAULT_MAIN_TOOLS))
+    if not settings.web_search_enabled:
+        tools = [t for t in tools if t is not web_search_tool]
     return tools
 
 
@@ -233,16 +372,31 @@ async def run_analysis(
     settings: Settings | None = None,
     *,
     graph: Any | None = None,
+    timeout_seconds: int | None = None,
+    recursion_limit: int | None = None,
 ) -> AnalysisRun:
-    """执行一次分析图，返回结构化结果（payload 为 AnalysisPayload 或 None）。"""
+    """执行一次分析图，返回结构化结果（payload 为 AnalysisPayload 或 None）。
+
+    timeout_seconds / recursion_limit 可由调用方覆盖：
+    - 逐条资讯分析用 `analysis_timeout_seconds`（默认 300）
+    - 盘前/盘后简报走深度多轮 ReAct，用 `brief_timeout_seconds`（默认 600）
+
+    recursion_limit 必须通过 config 显式传入：LangGraph 默认 10007 等于没有上限，
+    深度场景（多轮工具 + 子 agent）需要真正的步数刹车，否则只能靠超时兜底。
+    """
     settings = settings or get_settings()
+    timeout = timeout_seconds or settings.analysis_timeout_seconds
+    limit = recursion_limit or settings.agent_recursion_limit
     started = time.perf_counter()
     compiled = graph if graph is not None else get_analysis_graph(agent_type, settings)
 
     try:
         result = await asyncio.wait_for(
-            compiled.ainvoke({"messages": [HumanMessage(content=user_prompt)]}),
-            timeout=settings.analysis_timeout_seconds,
+            compiled.ainvoke(
+                {"messages": [HumanMessage(content=user_prompt)]},
+                config={"recursion_limit": limit},
+            ),
+            timeout=timeout,
         )
     except TimeoutError:
         return AnalysisRun(latency_ms=int((time.perf_counter() - started) * 1000), error="timeout")

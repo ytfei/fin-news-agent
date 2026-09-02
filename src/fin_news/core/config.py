@@ -143,6 +143,12 @@ class Settings(BaseSettings):
     use_deep_agents: bool = True
     analysis_concurrency: int = 4
     analysis_timeout_seconds: int = 300
+    # 盘前/盘后简报：走 ReAct 深度分析（多轮工具调用 + 子 agent 并行），
+    # 耗时预算比逐条资讯分析更宽松
+    brief_timeout_seconds: int = 600
+    # ReAct 循环步数上限（LangGraph 按节点计数，子 agent 内部也计步）。
+    # LangGraph 默认 10007 等于没有上限、纯靠超时兜底，深度场景需显式收紧。
+    agent_recursion_limit: int = 80
 
     # 评分 / 分析的实现层：langgraph 走 LangGraph 图 + 原生结构化输出，
     # legacy 走自研 llm/client.py；langgraph 失败会自动回退 legacy

@@ -27,7 +27,6 @@ from fin_news.agents.tools.market_data import (
     top_list_of_day,
     us_overnight,
 )
-from fin_news.agents.tools.retrieval import format_hits, history_search
 from fin_news.core.config import Settings, get_settings
 from fin_news.core.db import session_scope
 from fin_news.core.enums import AgentType, MarketPeriod, ReportStatus
@@ -38,6 +37,12 @@ from fin_news.models.analysis import AnalysisReport
 logger = get_logger("agents.market")
 
 OVERNIGHT_HOURS = 12
+
+# 上下文预算：盘前盘后改走「ReAct 深度分析」后，prompt 需为多轮工具结果留足空间，
+# 故预取只保留 Agent 靠工具难以高效重建的骨架数据，并统一截断。
+SNAPSHOT_CHARS = 1500  # 市场快照（指数 / 涨跌家数 / 板块），与 qa_agent 惯例一致
+NEWS_INDEX_CHARS = 2000  # 资讯索引：仅标题 + 评分 + id
+BRIEF_LIST_CHARS = 800  # 辅助列表（隔夜外盘 / 龙虎榜）
 
 
 # ----------------------------------------------------------------------
@@ -115,7 +120,14 @@ async def _run_brief_agent(
         try:
             # 经 registry 拿缓存图：统一入口（deepagents 分支委托 get_analysis_graph）
             graph = get_agent(agent_type, settings)
-            run = await run_analysis(agent_type, user_prompt, settings, graph=graph)
+            # 简报走深度多轮 ReAct（子 agent 并行 + 外部检索），用更宽松的耗时预算
+            run = await run_analysis(
+                agent_type,
+                user_prompt,
+                settings,
+                graph=graph,
+                timeout_seconds=settings.brief_timeout_seconds,
+            )
             if run.payload is not None:
                 return AgentOutput(
                     data=run.payload.model_dump(),
@@ -157,29 +169,27 @@ async def _build_context(
     prev_market = await market_snapshot(session, prev_date) if prev_date else {}
     top_list = await top_list_of_day(session, trade_date, limit=15) if period == MarketPeriod.POST_MARKET else []
 
-    # 历史情境：用当日高评分标题做一次向量检索
-    history_text = "（暂无）"
-    if news_items:
-        try:
-            query = " ".join(n["title"] for n in news_items[:5])
-            hits = await history_search(session, query, top_k=6)
-            history_text = format_hits(hits)[:2500]
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("历史检索失败", error=str(exc)[:200])
+    # 历史情境不再预取：改为交给子 agent（newsflow-analyst / attribution-analyst）
+    # 按需调用 history_search 深挖。预取一份再让 Agent 查一遍会造成 token 翻倍，
+    # 且会架空 ReAct 的检索动机（Agent 无需检索即可作答）。
 
-    news_text = "\n".join(
-        f"- [id:{n['id']}]（评分{n['score']}）{n['title']}\n  {n.get('score_reason') or ''}"
-        for n in news_items
-    ) or "（今日暂无高评分资讯）"
+    # 资讯索引：只给「标题 + 评分 + id」骨架，细节由 Agent 决定深挖哪些条，
+    # id 同时用于归因挂 news_id 与填 references。
+    news_text = (
+        "\n".join(f"- [id:{n['id']}]（评分{n['score']}）{n['title']}" for n in news_items)[
+            :NEWS_INDEX_CHARS
+        ]
+        or "（今日暂无高评分资讯）"
+    )
 
     return {
         "trade_date": trade_date.isoformat(),
-        "us_market": json.dumps(us, ensure_ascii=False),
-        "prev_market": json.dumps(prev_market, ensure_ascii=False),
-        "market": json.dumps(market, ensure_ascii=False),
+        # us_daily 无权限时这里会是空列表，隔夜外盘由 overnight-analyst 用 web_search 补齐
+        "us_market": json.dumps(us, ensure_ascii=False)[:BRIEF_LIST_CHARS],
+        "prev_market": json.dumps(prev_market, ensure_ascii=False)[:SNAPSHOT_CHARS],
+        "market": json.dumps(market, ensure_ascii=False)[:SNAPSHOT_CHARS],
         "news": news_text,
-        "top_list": json.dumps(top_list, ensure_ascii=False),
-        "history": history_text,
+        "top_list": json.dumps(top_list, ensure_ascii=False)[:BRIEF_LIST_CHARS],
         "_news_ids": [n["id"] for n in news_items],
     }
 

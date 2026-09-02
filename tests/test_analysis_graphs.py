@@ -3,13 +3,18 @@ from __future__ import annotations
 
 from fin_news.agents.graphs.analysis_graphs import (
     AGENT_GRAPH_CONFIG,
+    MAIN_TOOLS,
     AnalysisRun,
     _macro_subagents,
     _main_tools,
     _model_of,
+    _post_market_subagents,
+    _pre_market_subagents,
+    _subagents_for,
     _usage_of,
     build_analysis_graph,
     run_analysis,
+    web_search_tool,
 )
 from fin_news.agents.schemas import AnalysisPayload, EntityItemModel
 from fin_news.core.config import Settings
@@ -137,12 +142,14 @@ def test_model_of_empty_messages():
 
 
 class _FakeGraph:
-    """可注入的假图：ainvoke 返回预设结果。"""
+    """可注入的假图：ainvoke 返回预设结果，并记录调用参数便于断言。"""
 
     def __init__(self, result):
         self._result = result
+        self.calls: list[dict] = []
 
-    async def ainvoke(self, state):
+    async def ainvoke(self, state, config=None):
+        self.calls.append({"state": state, "config": config})
         return self._result
 
 
@@ -166,3 +173,72 @@ async def test_run_analysis_none_payload_is_not_error():
     graph = _FakeGraph({"messages": [], "structured_response": None})
     run = await run_analysis(AgentType.STOCK, "提示", _settings(), graph=graph)
     assert run.payload is None
+
+
+# ------------------------------ 步数上限 ------------------------------
+
+
+async def test_run_analysis_passes_recursion_limit():
+    """recursion_limit 必须经 config 传入：LangGraph 默认 10007 等于没有上限。"""
+    graph = _FakeGraph({"messages": [], "structured_response": None})
+    await run_analysis(AgentType.STOCK, "提示", _settings(agent_recursion_limit=50), graph=graph)
+    assert graph.calls, "图未被调用"
+    assert graph.calls[0]["config"] == {"recursion_limit": 50}
+
+
+# ------------------------------ 盘前 / 盘后子 agent ------------------------------
+
+
+def test_pre_market_subagents():
+    off = _pre_market_subagents(_settings(web_search_enabled=False))
+    on = _pre_market_subagents(_settings(web_search_enabled=True))
+    names_off = [s["name"] for s in off]
+    names_on = [s["name"] for s in on]
+    # 消息面与盘面预判不依赖搜索，始终挂载
+    assert "newsflow-analyst" in names_off
+    assert "positioning-analyst" in names_off
+    # 隔夜外盘依赖 web_search（us_daily 无权限），未配置时不挂
+    assert "overnight-analyst" not in names_off
+    assert "overnight-analyst" in names_on
+
+
+def test_post_market_subagents():
+    off = _post_market_subagents(_settings(web_search_enabled=False))
+    on = _post_market_subagents(_settings(web_search_enabled=True))
+    names_off = [s["name"] for s in off]
+    names_on = [s["name"] for s in on]
+    assert "tape-analyst" in names_off
+    assert "attribution-analyst" in names_off
+    assert "outlook-analyst" not in names_off
+    assert "outlook-analyst" in names_on
+
+
+def test_subagents_for_dispatch():
+    """仅宏观与盘前盘后拆分子 agent，个股 / 行业不拆。"""
+    s = _settings(web_search_enabled=True)
+    assert _subagents_for(AgentType.MACRO_POLICY, s) is not None
+    assert _subagents_for(AgentType.PRE_MARKET, s) is not None
+    assert _subagents_for(AgentType.POST_MARKET, s) is not None
+    assert _subagents_for(AgentType.STOCK, s) is None
+    assert _subagents_for(AgentType.INDUSTRY, s) is None
+
+
+# ------------------------------ 工具分配 ------------------------------
+
+
+def test_main_tools_web_search_enabled_for_pre_post_market():
+    """盘前盘后需要外部信息（隔夜外盘 / 机构解读）。"""
+    on = _main_tools(AgentType.PRE_MARKET, _settings(web_search_enabled=True))
+    off = _main_tools(AgentType.PRE_MARKET, _settings(web_search_enabled=False))
+    assert web_search_tool in on
+    # 未配置搜索服务时剔除，避免 ReAct 循环白调一个必定不可用的工具
+    assert web_search_tool not in off
+    assert web_search_tool in _main_tools(AgentType.POST_MARKET, _settings(web_search_enabled=True))
+
+
+def test_main_tools_declarative_map_covers_graph_agents():
+    """声明式映射覆盖所有走图的 Agent（新增 Agent 只改这张表）。"""
+    assert set(MAIN_TOOLS) == set(AGENT_GRAPH_CONFIG)
+    # 个股 / 行业不依赖外部搜索
+    assert web_search_tool not in MAIN_TOOLS[AgentType.STOCK]
+    assert web_search_tool not in MAIN_TOOLS[AgentType.INDUSTRY]
