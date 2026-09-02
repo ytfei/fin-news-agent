@@ -156,7 +156,7 @@ def get_agent(agent_type: AgentType, settings: Any | None = None) -> Any:
 
     if spec.framework == "legacy":
         raise NotImplementedError(
-            f"{agent_type.value} 尚未图化：追问依赖 SSE 流式与多轮 RAG"
+            f"{agent_type.value} 尚未图化：追问依赖 SSE 流式与多轮 RAG" +
             f"（见 docs/05-agent-refactor-design.md P4），请直接使用 qa_agent.QAAgent"
         )
 

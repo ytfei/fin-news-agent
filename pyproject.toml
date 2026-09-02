@@ -33,6 +33,7 @@ dependencies = [
     "httpx>=0.27",
     "tenacity>=9.0",
     "structlog>=24.1",
+    "tavily-python>=0.8.0",
 ]
 
 # 用 dependency-groups 而不是 optional-dependencies：
@@ -60,6 +61,8 @@ package = true
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# live：会真实调用外部服务（Tavily 等）、消耗额度，默认跳过
+markers = ["live: 需要真实外部服务的端到端用例（默认跳过）"]
 
 [tool.ruff]
 line-length = 110

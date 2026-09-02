@@ -156,9 +156,23 @@ class Settings(BaseSettings):
     # LangSmith 项目名（追踪用，未配置 API Key 时自动不生效）
     langchain_project: str = "fin-news-v5"
 
+    # ---------------- 外部检索（Tavily） ----------------
+    # 见 https://docs.tavily.com/sdk/python/reference
     web_search_enabled: bool = False
-    web_search_base_url: str = ""
+    # 留空时回退到 SDK 约定的 TAVILY_API_KEY 环境变量
     web_search_api_key: str = ""
+    # 留空走 SDK 默认 https://api.tavily.com；自建网关 / 代理时填网关地址
+    web_search_base_url: str = ""
+    web_search_topic: Literal["general", "news", "finance"] = "news"
+    web_search_depth: Literal["basic", "advanced", "fast", "ultra-fast"] = "basic"
+    # day / week / month / year，留空表示不限时间
+    web_search_time_range: Literal["", "day", "week", "month", "year"] = "week"
+    web_search_max_results: int = 5
+    # ISO 639-1 或英文名，仅用于排序加权；留空表示不加权
+    web_search_language: str = "zh-cn"
+    web_search_timeout_seconds: float = 30.0
+    web_search_include_domains: Annotated[list[str], NoDecode] = Field(default_factory=list)
+    web_search_exclude_domains: Annotated[list[str], NoDecode] = Field(default_factory=list)
 
     # ---------------- Pipeline ----------------
     worker_poll_interval_seconds: float = 2.0
@@ -181,7 +195,13 @@ class Settings(BaseSettings):
     api_prefix: str = "/api/v1"
     cors_origins: Annotated[list[str], NoDecode] = Field(default_factory=lambda: ["*"])
 
-    @field_validator("news_sources", "cors_origins", mode="before")
+    @field_validator(
+        "news_sources",
+        "cors_origins",
+        "web_search_include_domains",
+        "web_search_exclude_domains",
+        mode="before",
+    )
     @classmethod
     def _coerce_str_list(cls, value: object) -> list[str]:
         return parse_str_list(value)
