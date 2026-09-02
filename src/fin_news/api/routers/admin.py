@@ -80,6 +80,10 @@ async def backlog(session: SessionDep):
     return BacklogOut(
         pending=data["pending"],
         overdue=data["overdue"],
+        overdue_sum=data["overdue_sum"],
+        overdue_3m=data["overdue_3m"],
+        overdue_5m=data["overdue_5m"],
+        overdue_10m=data["overdue_10m"],
         dead_letter=data["dead_letter"],
         by_type={r[0]: int(r[1]) for r in rows.all()},
     )

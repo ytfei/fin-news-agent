@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import time
 from collections.abc import Iterable
 
 from sqlalchemy import select
@@ -15,7 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from fin_news.agents.scoring_agent import ScoringAgent
 from fin_news.core.config import Settings, get_settings
 from fin_news.core.enums import EventStatus, EventType, NewsStatus
-from fin_news.core.logging import get_logger
+from fin_news.core.logging import elapsed_ms, get_logger
 from fin_news.events.bus import EventBus
 from fin_news.models.event import IngestEvent
 from fin_news.models.news import NewsItem
@@ -36,6 +37,8 @@ async def handle(
 ) -> None:
     settings = settings or get_settings()
     news_ids = [e.aggregate_id for e in events]
+    started = time.perf_counter()
+    logger.info("评分批次开始", events=len(events), news_ids=news_ids[:20])
 
     if not settings.has_llm_credentials():
         # 未配置模型凭据：放回队列，不消耗重试次数，等配置后自动继续
@@ -50,11 +53,26 @@ async def handle(
     pending = [i for i in item_by_id.values() if i.status in (NewsStatus.NEW, NewsStatus.SCORE_FAILED)]
     if not pending:
         # 已被其它批次评过分：确保下游事件存在即可，本批事件直接确认
-        await _publish_scored(session, bus, [i for i in item_by_id.values() if i.score is not None])
+        published = await _publish_scored(
+            session, bus, [i for i in item_by_id.values() if i.score is not None]
+        )
         for event in events:
             await bus.ack(event)
+        logger.info(
+            "评分批次结束（资讯均已评过分，直接确认）",
+            events=len(events),
+            published=published,
+            elapsed_ms=elapsed_ms(started),
+        )
         return
 
+    logger.info(
+        "评分批次待处理",
+        events=len(events),
+        pending=len(pending),
+        skipped=len(item_by_id) - len(pending),
+        news_ids=[i.id for i in pending][:20],
+    )
     for item in pending:
         item.status = NewsStatus.SCORING
     await session.flush()
@@ -77,7 +95,7 @@ async def handle(
             if not newly:
                 break
     except Exception:  # noqa: BLE001
-        logger.exception("批量评分失败", count=len(pending))
+        logger.exception("批量评分失败", count=len(pending), elapsed_ms=elapsed_ms(started))
         await session.rollback()
         # 回滚后事件仍处于 PROCESSING，由 worker 的 fail 逻辑退避重试
         raise
@@ -88,7 +106,9 @@ async def handle(
         item.retry_count = (item.retry_count or 0) + 1
         item.last_error = f"模型漏评（补打 {RESCUE_ROUNDS} 轮仍缺失）"
 
-    await _publish_scored(session, bus, [i for i in item_by_id.values() if i.score is not None])
+    published = await _publish_scored(
+        session, bus, [i for i in item_by_id.values() if i.score is not None]
+    )
 
     for event in events:
         item = item_by_id.get(event.aggregate_id)
@@ -102,19 +122,26 @@ async def handle(
         else:
             await bus.ack(event)
 
-    logger.info("评分批次完成", total=len(pending), scored=len(scored_ids), missed=len(missing_ids))
+    logger.info(
+        "评分批次完成",
+        total=len(pending),
+        scored=len(scored_ids),
+        missed=len(missing_ids),
+        published=published,
+        elapsed_ms=elapsed_ms(started),
+    )
 
 
 async def _publish_scored(
     session: AsyncSession, bus: EventBus, items: Iterable[NewsItem]
-) -> None:
-    """为已评分的资讯发布 news.scored 事件。
+) -> int:
+    """为已评分的资讯发布 news.scored 事件，返回实际发布条数。
 
     只对「尚未成功处理过」的资讯发布，避免重复触发向量化与深度分析。
     """
     items = [i for i in items if i.score is not None]
     if not items:
-        return
+        return 0
 
     ids = [i.id for i in items]
     done_rows = await session.execute(
@@ -126,12 +153,24 @@ async def _publish_scored(
     )
     already_done = {row[0] for row in done_rows.all()}
 
+    published = 0
     for item in items:
         if item.id in already_done:
             continue
-        await bus.publish(
+        event_id = await bus.publish(
             EventType.NEWS_SCORED,
             item.id,
             payload={"score": item.score, "band": item.band.value if item.band else None},
             priority=2,
         )
+        if event_id is not None:
+            published += 1
+
+    logger.info(
+        "发布 news.scored 事件",
+        requested=len(items),
+        published=published,
+        skipped_done=len(already_done),
+        deduped=len(items) - len(already_done) - published,
+    )
+    return published

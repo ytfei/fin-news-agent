@@ -317,8 +317,22 @@ async def run_scoring(
     }
 
     timeout = settings.llm_timeout_seconds * (1 + MAX_RESCUE_ROUNDS)
+    logger.info("评分图执行开始", count=len(items), timeout_seconds=timeout)
     out = await asyncio.wait_for(graph.ainvoke(state), timeout=timeout)
     run = _to_run(out)
+    logger.info(
+        "评分图执行结束",
+        count=len(items),
+        scored=len(run.items),
+        missing=len(items) - len(run.items),
+        rounds=run.rounds,
+        method=run.structured_method,
+        model=run.model,
+        latency_ms=run.latency_ms,
+        prompt_tokens=run.prompt_tokens,
+        completion_tokens=run.completion_tokens,
+        error=run.error,
+    )
 
     # 退化护栏：模型偶尔会整批给同一个分，重试一次并择优
     if settings.score_retry_on_degenerate and _is_degenerate(run, len(items)):

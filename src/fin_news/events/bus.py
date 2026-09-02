@@ -211,24 +211,50 @@ class EventBus:
         return reclaimed
 
     async def backlog(self) -> dict[str, int]:
-        """积压统计：pending / overdue / dead_letter。"""
+        """积压统计：pending / overdue（按过期时长分桶）/ dead_letter。
+
+        overdue 为累计口径（「X 分钟以内」）：
+        - overdue_3m  : 过期时长 ≤ 3 分钟
+        - overdue_5m  : 过期时长 ≤ 5 分钟
+        - overdue_10m : 过期时长 ≤ 10 分钟
+        - overdue_sum : 全部已到期（含 > 10 分钟）
+
+        关系：overdue_3m ≤ overdue_5m ≤ overdue_10m ≤ overdue_sum。
+        「超过 10 分钟的积压」= overdue_sum - overdue_10m。
+        """
         now = _now()
         from sqlalchemy import func
 
-        pending = await self.session.scalar(
-            select(func.count()).select_from(IngestEvent).where(IngestEvent.status == EventStatus.PENDING)
+        pending_base = select(func.count()).select_from(IngestEvent).where(
+            IngestEvent.status == EventStatus.PENDING
         )
-        overdue = await self.session.scalar(
-            select(func.count())
-            .select_from(IngestEvent)
-            .where(IngestEvent.status == EventStatus.PENDING, IngestEvent.available_at < now)
+        # available_at 是过去时间，过期时长 = now - available_at，
+        # 「≤ N 分钟」等价于 available_at >= now - N 分钟
+        overdue_cond = IngestEvent.available_at < now
+
+        pending = await self.session.scalar(pending_base)
+        overdue_sum = await self.session.scalar(pending_base.where(overdue_cond))
+        overdue_3m = await self.session.scalar(
+            pending_base.where(overdue_cond, IngestEvent.available_at >= now - timedelta(minutes=3))
+        )
+        overdue_5m = await self.session.scalar(
+            pending_base.where(overdue_cond, IngestEvent.available_at >= now - timedelta(minutes=5))
+        )
+        overdue_10m = await self.session.scalar(
+            pending_base.where(overdue_cond, IngestEvent.available_at >= now - timedelta(minutes=10))
         )
         dead = await self.session.scalar(
             select(func.count()).select_from(DeadLetter).where(DeadLetter.resolved_at.is_(None))
         )
+
+        overdue_sum = int(overdue_sum or 0)
         return {
             "pending": int(pending or 0),
-            "overdue": int(overdue or 0),
+            "overdue": overdue_sum,  # 兼容旧字段，等同 overdue_sum
+            "overdue_sum": overdue_sum,
+            "overdue_3m": int(overdue_3m or 0),
+            "overdue_5m": int(overdue_5m or 0),
+            "overdue_10m": int(overdue_10m or 0),
             "dead_letter": int(dead or 0),
         }
 

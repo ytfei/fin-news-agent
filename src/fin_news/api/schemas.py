@@ -251,6 +251,10 @@ class HealthOut(BaseModel):
 class BacklogOut(BaseModel):
     pending: int = 0
     overdue: int = 0
+    overdue_sum: int = 0
+    overdue_3m: int = 0
+    overdue_5m: int = 0
+    overdue_10m: int = 0
     dead_letter: int = 0
     by_type: dict[str, int] = Field(default_factory=dict)
 

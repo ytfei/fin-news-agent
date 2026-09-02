@@ -11,7 +11,7 @@ from fin_news.agents.llm import get_llm_client, get_semaphore
 from fin_news.agents.prompts import SCORING_SCHEMA, SCORING_SYSTEM, SCORING_VERSION
 from fin_news.core.config import Settings, get_settings
 from fin_news.core.enums import EntityType, EventType, NewsStatus
-from fin_news.core.logging import get_logger
+from fin_news.core.logging import get_logger, stage
 from fin_news.core.timeutil import now_utc
 from fin_news.domain.schemas import ScoreBatchResult, ScoreEntity, ScoreItemResult
 from fin_news.domain.scoring import band_for_score, clamp_score
@@ -52,55 +52,76 @@ class ScoringAgent:
             return {}
 
         expected_ids = {i.id for i in items}
-        result: ScoreBatchResult | None = None
+        async with stage(
+            logger,
+            "评分 Agent",
+            count=len(items),
+            framework=self.settings.agent_framework,
+            provider=self.settings.llm_default_provider,
+            model=self.settings.model_for(self.settings.llm_default_provider, "scoring"),
+            news_ids=[i.id for i in items][:20],
+        ) as out:
+            result: ScoreBatchResult | None = None
 
-        if self.settings.agent_framework == "langgraph":
-            try:
-                run = await run_scoring(items, self.settings)
-            except Exception as exc:  # noqa: BLE001 - 图执行失败（含超时）回退 legacy
-                logger.warning(
-                    "LangGraph 评分失败，回退 legacy 调用", count=len(items), error=str(exc)[:300]
-                )
-                run = None
+            if self.settings.agent_framework == "langgraph":
+                try:
+                    run = await run_scoring(items, self.settings)
+                except Exception as exc:  # noqa: BLE001 - 图执行失败（含超时）回退 legacy
+                    logger.warning(
+                        "LangGraph 评分失败，回退 legacy 调用", count=len(items), error=str(exc)[:300]
+                    )
+                    run = None
 
-            if run is not None and run.items:
-                result = self._run_to_batch_result(run)
-                logger.info(
-                    "评分完成（langgraph）",
-                    total=len(items),
-                    scored=len(run.items),
-                    model=run.model,
-                    rounds=run.rounds,
-                    latency_ms=run.latency_ms,
-                    prompt_tokens=run.prompt_tokens,
-                    completion_tokens=run.completion_tokens,
-                )
-                if self.settings.score_dual_run:
-                    await self._compare_with_legacy(items, expected_ids, run)
-            elif run is not None:
-                logger.warning(
-                    "LangGraph 未产出任何评分，回退 legacy", error=run.error, rounds=run.rounds
-                )
+                if run is not None and run.items:
+                    result = self._run_to_batch_result(run)
+                    out["path"] = "langgraph"
+                    logger.info(
+                        "评分完成（langgraph）",
+                        total=len(items),
+                        scored=len(run.items),
+                        model=run.model,
+                        rounds=run.rounds,
+                        latency_ms=run.latency_ms,
+                        prompt_tokens=run.prompt_tokens,
+                        completion_tokens=run.completion_tokens,
+                    )
+                    if self.settings.score_dual_run:
+                        await self._compare_with_legacy(items, expected_ids, run)
+                elif run is not None:
+                    logger.warning(
+                        "LangGraph 未产出任何评分，回退 legacy", error=run.error, rounds=run.rounds
+                    )
 
-        if result is None:
-            result = await self._score_legacy(items, expected_ids)
+            if result is None:
+                result = await self._score_legacy(items, expected_ids)
+                out["path"] = "legacy"
 
-        if not result.items:
-            for item in items:
-                item.status = NewsStatus.SCORE_FAILED
-                item.retry_count = (item.retry_count or 0) + 1
-                item.last_error = "评分失败：模型未返回可解析结果"
-            return {}
+            if not result.items:
+                for item in items:
+                    item.status = NewsStatus.SCORE_FAILED
+                    item.retry_count = (item.retry_count or 0) + 1
+                    item.last_error = "评分失败：模型未返回可解析结果"
+                out.update(scored=0, missing=len(items), result="模型未返回可解析结果")
+                return {}
 
-        batch_id = uuid.uuid4().hex[:16]
-        await self._persist(session, items, result, batch_id)
+            batch_id = uuid.uuid4().hex[:16]
+            await self._persist(session, items, result, batch_id)
 
-        # 补发下游事件：cli score 不经过事件总线，不补发的话这些资讯
-        # 永远不会进入向量化与深度分析。publish 本身幂等（部分唯一索引），
-        # 所以从 on_ingested 调用时重复发布是安全的。
-        await self._publish_scored_events(session, result)
+            # 补发下游事件：cli score 不经过事件总线，不补发的话这些资讯
+            # 永远不会进入向量化与深度分析。publish 本身幂等（部分唯一索引），
+            # 所以从 on_ingested 调用时重复发布是安全的。
+            published = await self._publish_scored_events(session, result)
 
-        return {r.id: r for r in result.items}
+            out.update(
+                batch_id=batch_id,
+                scored=len(result.items),
+                missing=len(items) - len(result.items),
+                suspect=result.is_suspect,
+                model=result.model,
+                latency_ms=result.latency_ms,
+                published=published,
+            )
+            return {r.id: r for r in result.items}
 
     async def _publish_scored_events(self, session: AsyncSession, result: ScoreBatchResult) -> int:
         bus = EventBus(session, worker_id="scoring")

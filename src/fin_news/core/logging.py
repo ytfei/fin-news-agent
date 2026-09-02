@@ -8,6 +8,9 @@ from __future__ import annotations
 
 import logging
 import sys
+import time
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any
 
 import structlog
@@ -63,3 +66,65 @@ def configure_logging(level: str | None = None, verbosity: int = 0) -> None:
 def get_logger(name: str = "fin_news", **bind: Any) -> structlog.stdlib.BoundLogger:
     configure_logging()
     return structlog.get_logger(name, **bind)
+
+
+# ----------------------------------------------------------------------
+# 执行路径追踪
+# ----------------------------------------------------------------------
+def bind_context(**fields: Any) -> None:
+    """把字段绑定到当前上下文，之后该上下文内的所有日志都会自动带上。
+
+    用于串联一次运行的完整路径（run_id / worker_id / event_type 等），
+    无需在每层调用点手动透传。
+    """
+    structlog.contextvars.bind_contextvars(**fields)
+
+
+def unbind_context(*keys: str) -> None:
+    structlog.contextvars.unbind_contextvars(*keys)
+
+
+def elapsed_ms(started: float) -> int:
+    return int((time.perf_counter() - started) * 1000)
+
+
+@asynccontextmanager
+async def stage(
+    logger: structlog.stdlib.BoundLogger,
+    name: str,
+    *,
+    level: str = "info",
+    **fields: Any,
+) -> AsyncIterator[dict[str, Any]]:
+    """记录一个阶段的「开始 / 结束 / 异常」，用于把执行路径串成一条链。
+
+    开始 / 结束日志都按 level 输出（默认 info），结束日志自动带 elapsed_ms；
+    阶段内可通过返回的字典补充结果字段：
+
+        async with stage(logger, "评分 Agent", count=20) as out:
+            result = await agent.score_items(session, items)
+            out["scored"] = len(result)
+
+    异常只记一行摘要（类型 + 消息），不重复打印堆栈：完整 traceback 由最外层
+    处理者（handler / worker / cli）用 logger.exception 打一次即可，
+    否则同一个异常会在路径的每一层都刷一份堆栈。
+    """
+    started = time.perf_counter()
+    log = getattr(logger, level, logger.info)
+    log(f"{name} 开始", **fields)
+    out: dict[str, Any] = {}
+    try:
+        yield out
+    except Exception as exc:
+        logger.error(
+            f"{name} 异常",
+            **{
+                **fields,
+                **out,
+                "elapsed_ms": elapsed_ms(started),
+                "error": f"{type(exc).__name__}: {str(exc)[:300]}",
+            },
+        )
+        raise
+    else:
+        log(f"{name} 结束", **{**fields, **out, "elapsed_ms": elapsed_ms(started)})

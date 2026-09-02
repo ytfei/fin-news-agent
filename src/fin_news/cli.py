@@ -16,6 +16,10 @@
 
 日志级别：默认 INFO；`-v` 升到 DEBUG（看业务 debug 日志）；`-vv` 再把
 第三方库（httpx/openai/sqlalchemy 等）的日志也放开到 DEBUG。
+
+执行路径追踪：`pipeline` / `worker` 每次运行会生成 `run_id` 并绑定到日志上下文，
+cli → worker → handler → agent 的每一环都会输出「开始 / 结束（含 elapsed_ms）/ 异常」，
+按 run_id 过滤即可还原一次运行的完整执行路径。
 """
 from __future__ import annotations
 
@@ -29,6 +33,7 @@ from fin_news.core.logging import configure_logging, get_logger
 
 if TYPE_CHECKING:
     from fin_news.agents.embeddings import Embedder
+    from fin_news.pipeline.worker import PipelineWorker
 
 # 不在模块级调用 get_logger —— 那会在 import 时就用默认级别完成日志配置，导致
 # -v/-vv 无法生效。日志级别统一由 main() 解析参数后配置，各命令函数内再 get_logger
@@ -57,23 +62,93 @@ async def _cmd_ingest() -> int:
 
 
 async def _cmd_pipeline(once: bool = True) -> int:
+    import time
+    import uuid
+
     from fin_news.core.db import init_db
+    from fin_news.core.logging import bind_context, elapsed_ms, stage
     from fin_news.pipeline.worker import PipelineWorker
 
     logger = get_logger(_LOG_NAME)
-    await init_db()
+    settings = get_settings()
+    command = "pipeline" if once else "worker"
+
+    # 一次运行的唯一标识：贯穿 cli → worker → handler → agent 的所有日志
+    run_id = uuid.uuid4().hex[:12]
+    bind_context(run_id=run_id, command=command)
+
+    started = time.perf_counter()
+    logger.info(
+        "Pipeline 运行开始",
+        mode="单轮" if once else "常驻",
+        worker_batch_limit=settings.worker_batch_limit,
+        worker_poll_interval_seconds=settings.worker_poll_interval_seconds,
+        scoring_batch_size=settings.scoring_batch_size,
+        scoring_window_seconds=settings.scoring_window_seconds,
+        agent_framework=settings.agent_framework,
+        use_deep_agents=settings.use_deep_agents,
+        llm_provider=settings.llm_default_provider,
+        llm_configured=settings.has_llm_credentials(),
+        embedding_provider=settings.embedding_provider,
+        score_threshold_vectorize=settings.score_threshold_vectorize,
+    )
+
     worker = PipelineWorker()
-    if once:
-        await worker.reclaim()
-        n = await worker.tick()
-        # 攒批未满的 news.ingested 事件仍在攒批器里（PROCESSING 态），
-        # 单轮模式下必须放回队列，否则会卡到 reclaim 超时
-        await worker.flush()
-        logger.info("本轮处理事件", count=n)
-        return 0
-    logger.info("启动常驻 worker")
-    await worker.run_forever()
-    return 0
+    bind_context(worker_id=worker.worker_id)
+    status = "完成"
+    exit_code = 0
+    try:
+        async with stage(logger, "初始化数据库"):
+            await init_db()
+
+        async with stage(logger, "回收超时事件"):
+            await worker.reclaim()
+
+        if once:
+            async with stage(logger, "消费事件") as out:
+                n = await worker.tick()
+                out["processed"] = n
+            # 攒批未满的 news.ingested 事件仍在攒批器里（PROCESSING 态），
+            # 单轮模式下必须放回队列，否则会卡到 reclaim 超时
+            async with stage(logger, "回写攒批事件") as out:
+                out["released"] = await worker.flush()
+        else:
+            # 常驻模式：启动 / 停止 / 每轮统计由 worker 自己打印（含 worker_id）
+            _install_stop_handler(worker)
+            await worker.run_forever()
+    except Exception:  # noqa: BLE001 - 结束日志必须打出来，异常统一在这里收口
+        status = "异常"
+        exit_code = 1
+        logger.exception("Pipeline 运行异常")
+    finally:
+        logger.info(
+            "Pipeline 运行结束",
+            status=status,
+            elapsed_ms=elapsed_ms(started),
+            **worker.stats,
+        )
+    return exit_code
+
+
+def _install_stop_handler(worker: PipelineWorker) -> None:
+    """SIGINT / SIGTERM 触发优雅退出：跑完当前批次 → flush 攒批 → 打印结束日志。
+
+    信号回调只置位，不打断进行中的批次；不支持信号回调的平台（如 Windows）
+    忽略即可，退回默认行为。
+    """
+    import signal
+
+    logger = get_logger(_LOG_NAME)
+
+    def _stop(signame: str) -> None:
+        logger.info("收到停止信号，开始优雅退出", signal=signame)
+        worker.stop()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            asyncio.get_running_loop().add_signal_handler(sig, _stop, sig.name)
+        except (NotImplementedError, RuntimeError, ValueError):
+            logger.debug("当前平台不支持信号回调，忽略优雅退出", signal=sig.name)
 
 
 async def _cmd_score() -> int:

@@ -23,7 +23,7 @@ from fin_news.agents.prompts import (
 from fin_news.agents.tools.market_data import latest_trade_date, market_snapshot
 from fin_news.core.config import Settings, get_settings
 from fin_news.core.enums import AgentType, NewsStatus, ReportStatus
-from fin_news.core.logging import get_logger
+from fin_news.core.logging import get_logger, stage
 from fin_news.core.timeutil import now_utc
 from fin_news.domain.scoring import agent_for_score
 from fin_news.domain.textutil import truncate
@@ -56,27 +56,56 @@ async def analyze_news(
     news.analysis_status = "PENDING"
     await session.flush()
 
-    context = await _build_context(session, news, agent_type, settings)
-    user_prompt = user_template.format(**context)
-
-    output: AgentOutput = await _run_analysis(agent_type, system_prompt, user_prompt, settings)
-
-    report = await _persist(session, news, agent_type, version, output)
-    news.status = NewsStatus.ANALYZED
-    news.analysis_status = "DONE"
-    news.retry_count = 0
-    news.last_error = None
-    await session.flush()
-
-    logger.info(
-        "分析完成",
-        agent=agent_type.value,
+    async with stage(
+        logger,
+        "深度分析 Agent",
         news_id=news.id,
-        report_id=report.id,
-        degraded=output.degraded,
-        latency_ms=output.latency_ms,
-    )
-    return report
+        agent=agent_type.value,
+        score=news.score,
+        framework=(
+            "deepagents"
+            if settings.agent_framework == "langgraph" and settings.use_deep_agents
+            else "legacy"
+        ),
+        model=settings.model_for(settings.llm_default_provider, "analysis"),
+        prompt_version=version,
+        timeout_seconds=settings.analysis_timeout_seconds,
+    ) as out:
+        context = await _build_context(session, news, agent_type, settings)
+        user_prompt = user_template.format(**context)
+        logger.debug(
+            "分析上下文已构建",
+            news_id=news.id,
+            agent=agent_type.value,
+            prompt_chars=len(user_prompt),
+        )
+
+        output: AgentOutput = await _run_analysis(agent_type, system_prompt, user_prompt, settings)
+        out.update(
+            path="deepagents" if not output.degraded else "legacy(降级)",
+            model=output.model,
+            latency_ms=output.latency_ms,
+            prompt_tokens=output.prompt_tokens,
+            completion_tokens=output.completion_tokens,
+            degraded=output.degraded,
+        )
+
+        report = await _persist(session, news, agent_type, version, output)
+        news.status = NewsStatus.ANALYZED
+        news.analysis_status = "DONE"
+        news.retry_count = 0
+        news.last_error = None
+        await session.flush()
+
+        out["report_id"] = report.id
+        logger.info(
+            "分析报告已落库",
+            agent=agent_type.value,
+            news_id=news.id,
+            report_id=report.id,
+            degraded=output.degraded,
+        )
+        return report
 
 
 async def analyze_news_by_id(
@@ -100,7 +129,22 @@ async def _run_analysis(
     """执行分析：优先 DeepAgents 图（缓存 + 结构化输出），失败降级单次调用。"""
     if settings.agent_framework == "langgraph" and settings.use_deep_agents:
         try:
+            logger.info(
+                "DeepAgents 图执行开始",
+                agent=agent_type.value,
+                timeout_seconds=settings.analysis_timeout_seconds,
+            )
             run = await run_analysis(agent_type, user_prompt, settings)
+            logger.info(
+                "DeepAgents 图执行结束",
+                agent=agent_type.value,
+                structured=run.payload is not None,
+                model=run.model,
+                latency_ms=run.latency_ms,
+                prompt_tokens=run.prompt_tokens,
+                completion_tokens=run.completion_tokens,
+                error=run.error,
+            )
             if run.payload is not None:
                 return AgentOutput(
                     data=run.payload.model_dump(),
@@ -120,6 +164,7 @@ async def _run_analysis(
                 agent=agent_type.value,
                 error=str(exc)[:300],
             )
+    logger.info("单次结构化调用开始", agent=agent_type.value)
     return await _run_plain_agent(system_prompt, user_prompt, settings)
 
 
