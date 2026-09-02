@@ -1,0 +1,31 @@
+# 密钥与本地环境（严禁打进镜像）
+.env
+.env.*
+
+# Python
+.venv
+__pycache__
+*.py[cod]
+.pytest_cache
+.ruff_cache
+.mypy_cache
+
+# 前端（web 有自己的 Dockerfile）
+web/node_modules
+web/dist
+web/tsconfig.tsbuildinfo
+
+# 文档与测试（构建不需要）
+tests
+docs
+*.md
+!README.md
+
+# 版本控制
+.git
+.gitignore
+
+# 构建产物与编排文件
+Dockerfile
+docker-compose.yml
+.dockerignore
