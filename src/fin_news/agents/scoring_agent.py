@@ -9,8 +9,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from fin_news.agents.graphs.scoring_graph import ScoringRun, build_payload, run_scoring
 from fin_news.agents.llm import get_llm_client, get_semaphore
 from fin_news.agents.prompts import SCORING_SCHEMA, SCORING_SYSTEM, SCORING_VERSION
+from fin_news.agents.registry import get_agent
 from fin_news.core.config import Settings, get_settings
-from fin_news.core.enums import EntityType, EventType, NewsStatus
+from fin_news.core.enums import AgentType, EntityType, EventType, NewsStatus
 from fin_news.core.logging import get_logger, stage
 from fin_news.core.timeutil import now_utc
 from fin_news.domain.schemas import ScoreBatchResult, ScoreEntity, ScoreItemResult
@@ -65,7 +66,9 @@ class ScoringAgent:
 
             if self.settings.agent_framework == "langgraph":
                 try:
-                    run = await run_scoring(items, self.settings)
+                    # 经 registry 拿缓存图：统一入口，框架细节对业务层透明
+                    graph = get_agent(AgentType.SCORING, self.settings)
+                    run = await run_scoring(items, self.settings, graph=graph)
                 except Exception as exc:  # noqa: BLE001 - 图执行失败（含超时）回退 legacy
                     logger.warning(
                         "LangGraph 评分失败，回退 legacy 调用", count=len(items), error=str(exc)[:300]

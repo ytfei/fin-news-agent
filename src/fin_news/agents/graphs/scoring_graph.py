@@ -276,8 +276,9 @@ def build_scoring_graph(settings: Settings | None = None, *, chat: Any | None = 
 _graphs: dict[str, Any] = {}
 
 
-def get_scoring_graph(settings: Settings) -> Any:
+def get_scoring_graph(settings: Settings | None = None) -> Any:
     """按 (prompt_version, provider, model) 缓存已编译的图。"""
+    settings = settings or get_settings()
     key = "|".join(
         [
             SCORING_VERSION,
@@ -292,13 +293,22 @@ def get_scoring_graph(settings: Settings) -> Any:
 
 
 async def run_scoring(
-    items: list[NewsItem], settings: Settings | None = None, *, chat: Any | None = None
+    items: list[NewsItem],
+    settings: Settings | None = None,
+    *,
+    chat: Any | None = None,
+    graph: Any | None = None,
 ) -> ScoringRun:
-    """执行一次评分图，返回结构化结果。"""
+    """执行一次评分图，返回结构化结果。
+
+    graph 可注入：业务层经 `registry.get_agent()` 拿缓存图后传入，使 registry 成为
+    统一入口；不传则回落到本模块的 `get_scoring_graph` 缓存。
+    chat 注入时（测试用）强制重建图且不走任何缓存。
+    """
     settings = settings or get_settings()
     if chat is not None:
         graph = build_scoring_graph(settings, chat=chat)  # 注入模型时不走缓存
-    else:
+    elif graph is None:
         graph = get_scoring_graph(settings)
 
     state: ScoringState = {

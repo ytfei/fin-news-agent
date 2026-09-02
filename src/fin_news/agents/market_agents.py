@@ -8,7 +8,8 @@ from typing import Any
 from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from fin_news.agents.base import AgentOutput, run_agent
+from fin_news.agents.base import AgentOutput, _run_plain_agent
+from fin_news.agents.graphs.analysis_graphs import run_analysis
 from fin_news.agents.prompts import (
     POST_MARKET_SYSTEM,
     POST_MARKET_USER_TEMPLATE,
@@ -17,7 +18,7 @@ from fin_news.agents.prompts import (
     PRE_MARKET_USER_TEMPLATE,
     PRE_MARKET_VERSION,
 )
-from fin_news.agents.tools.langchain_tools import build_toolset
+from fin_news.agents.registry import get_agent
 from fin_news.agents.tools.market_data import (
     high_score_news,
     is_trading_day,
@@ -82,12 +83,8 @@ async def _build_brief(
     # 内部字段不进模板
     template_ctx = {k: v for k, v in context.items() if not k.startswith("_")}
 
-    output: AgentOutput = await run_agent(
-        agent_type,
-        system_prompt,
-        user_template.format(**template_ctx),
-        tools=build_toolset(agent_type.value),
-        settings=settings,
+    output: AgentOutput = await _run_brief_agent(
+        agent_type, system_prompt, user_template.format(**template_ctx), settings
     )
 
     report = await _persist_brief(session, trade_date, period, agent_type, version, output, context)
@@ -100,6 +97,45 @@ async def _build_brief(
         latency_ms=output.latency_ms,
     )
     return report
+
+
+async def _run_brief_agent(
+    agent_type: AgentType,
+    system_prompt: str,
+    user_prompt: str,
+    settings: Settings,
+) -> AgentOutput:
+    """执行简报 Agent：优先 DeepAgents 图（缓存 + 结构化输出），失败降级单次调用。
+
+    与 analysis_agents._run_analysis 同构。差异：简报的上下文（行情 / 资讯 / 历史 /
+    龙虎榜）已由 _build_context 预取并内联进 user_prompt，Agent 侧工具仅用于按需
+    补充检索，不再重复预取（避免 token 翻倍）。
+    """
+    if settings.agent_framework == "langgraph" and settings.use_deep_agents:
+        try:
+            # 经 registry 拿缓存图：统一入口（deepagents 分支委托 get_analysis_graph）
+            graph = get_agent(agent_type, settings)
+            run = await run_analysis(agent_type, user_prompt, settings, graph=graph)
+            if run.payload is not None:
+                return AgentOutput(
+                    data=run.payload.model_dump(),
+                    model=run.model,
+                    prompt_tokens=run.prompt_tokens,
+                    completion_tokens=run.completion_tokens,
+                    latency_ms=run.latency_ms,
+                )
+            logger.warning(
+                "DeepAgents 未产出结构化结果，降级单次调用",
+                agent=agent_type.value,
+                error=run.error,
+            )
+        except Exception as exc:  # noqa: BLE001 - 图构建/执行失败均降级
+            logger.warning(
+                "DeepAgents 执行失败，降级单次调用",
+                agent=agent_type.value,
+                error=str(exc)[:300],
+            )
+    return await _run_plain_agent(system_prompt, user_prompt, settings)
 
 
 async def _build_context(

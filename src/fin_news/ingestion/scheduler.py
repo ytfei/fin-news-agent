@@ -69,8 +69,8 @@ async def job_sync_market() -> None:
 
 
 async def _today_is_trading_day() -> bool:
-    from fin_news.core.db import init_db, session_scope
     from fin_news.agents.tools.market_data import is_trading_day
+    from fin_news.core.db import init_db, session_scope
 
     await init_db()
     async with session_scope() as session:
@@ -79,8 +79,8 @@ async def _today_is_trading_day() -> bool:
 
 async def job_pre_market() -> None:
     """交易日盘前简报。"""
-    from fin_news.core.db import init_db
     from fin_news.agents.market_agents import run_pre_market
+    from fin_news.core.db import init_db
 
     if not await _today_is_trading_day():
         logger.info("非交易日，跳过盘前简报", trade_date=str(date.today()))
@@ -96,8 +96,8 @@ async def job_pre_market() -> None:
 
 async def job_post_market() -> None:
     """交易日盘后复盘简报。"""
-    from fin_news.core.db import init_db
     from fin_news.agents.market_agents import run_post_market
+    from fin_news.core.db import init_db
 
     if not await _today_is_trading_day():
         logger.info("非交易日，跳过盘后简报", trade_date=str(date.today()))

@@ -20,6 +20,7 @@ from fin_news.agents.prompts import (
     STOCK_USER_TEMPLATE,
     STOCK_VERSION,
 )
+from fin_news.agents.registry import get_agent
 from fin_news.agents.tools.market_data import latest_trade_date, market_snapshot
 from fin_news.core.config import Settings, get_settings
 from fin_news.core.enums import AgentType, NewsStatus, ReportStatus
@@ -134,7 +135,9 @@ async def _run_analysis(
                 agent=agent_type.value,
                 timeout_seconds=settings.analysis_timeout_seconds,
             )
-            run = await run_analysis(agent_type, user_prompt, settings)
+            # 经 registry 拿缓存图：统一入口（deepagents 分支内部委托 get_analysis_graph）
+            graph = get_agent(agent_type, settings)
+            run = await run_analysis(agent_type, user_prompt, settings, graph=graph)
             logger.info(
                 "DeepAgents 图执行结束",
                 agent=agent_type.value,

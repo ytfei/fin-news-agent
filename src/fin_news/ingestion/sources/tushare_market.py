@@ -407,6 +407,7 @@ async def build_us_overnight_from_news(session: AsyncSession, day: date) -> list
     只做关键词匹配，不虚构行情数字，字段里明确标注来源为「资讯」。
     """
     from datetime import datetime as dt
+
     from fin_news.models.news import NewsItem
 
     keywords = ("美股", "纳指", "纳斯达克", "道指", "标普", "隔夜")

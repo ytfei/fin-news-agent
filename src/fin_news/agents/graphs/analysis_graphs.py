@@ -16,8 +16,8 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from langchain_core.messages import HumanMessage
 from deepagents.middleware.subagents import SubAgent
+from langchain_core.messages import HumanMessage
 
 from fin_news.agents.llm.factory import get_model_factory
 from fin_news.agents.prompts import (
@@ -25,14 +25,24 @@ from fin_news.agents.prompts import (
     INDUSTRY_VERSION,
     MACRO_SYSTEM,
     MACRO_VERSION,
+    POST_MARKET_SYSTEM,
+    POST_MARKET_VERSION,
+    PRE_MARKET_SYSTEM,
+    PRE_MARKET_VERSION,
     STOCK_SYSTEM,
     STOCK_VERSION,
 )
 from fin_news.agents.schemas import AnalysisPayload
 from fin_news.agents.tools.langchain_tools import (
     history_search as history_search_tool,
+)
+from fin_news.agents.tools.langchain_tools import (
     market_snapshot as market_snapshot_tool,
+)
+from fin_news.agents.tools.langchain_tools import (
     stock_lookup as stock_lookup_tool,
+)
+from fin_news.agents.tools.langchain_tools import (
     web_search as web_search_tool,
 )
 from fin_news.core.config import Settings, get_settings
@@ -59,6 +69,10 @@ AGENT_GRAPH_CONFIG: dict[AgentType, tuple[str, str]] = {
     AgentType.MACRO_POLICY: (MACRO_SYSTEM, MACRO_VERSION),
     AgentType.INDUSTRY: (INDUSTRY_SYSTEM, INDUSTRY_VERSION),
     AgentType.STOCK: (STOCK_SYSTEM, STOCK_VERSION),
+    # 盘前/盘后：上下文由 market_agents._build_context 预取后内联进 prompt，
+    # 输出同样收敛到 AnalysisPayload（verdict/attribution 等走 extras）
+    AgentType.PRE_MARKET: (PRE_MARKET_SYSTEM, PRE_MARKET_VERSION),
+    AgentType.POST_MARKET: (POST_MARKET_SYSTEM, POST_MARKET_VERSION),
 }
 
 

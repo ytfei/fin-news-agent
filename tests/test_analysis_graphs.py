@@ -4,8 +4,8 @@ from __future__ import annotations
 from fin_news.agents.graphs.analysis_graphs import (
     AGENT_GRAPH_CONFIG,
     AnalysisRun,
-    _main_tools,
     _macro_subagents,
+    _main_tools,
     _model_of,
     _usage_of,
     build_analysis_graph,
@@ -58,12 +58,23 @@ def test_analysis_payload_model_dump_is_json_friendly():
 # ------------------------------ 图配置 ------------------------------
 
 
-def test_agent_graph_config_covers_analysis_types():
+def test_agent_graph_config_covers_all_graph_agents():
+    """图配置覆盖所有走 DeepAgents 的 Agent：3 个分析 + 盘前/盘后。"""
     assert set(AGENT_GRAPH_CONFIG) == {
         AgentType.MACRO_POLICY,
         AgentType.INDUSTRY,
         AgentType.STOCK,
+        AgentType.PRE_MARKET,
+        AgentType.POST_MARKET,
     }
+
+
+def test_graph_config_versions_match_registry_specs():
+    """图的 prompt_version 必须与 registry.AGENT_SPECS 一致，否则缓存键会分叉。"""
+    from fin_news.agents.registry import AGENT_SPECS
+
+    for agent_type, (_system, version) in AGENT_GRAPH_CONFIG.items():
+        assert AGENT_SPECS[agent_type].prompt_version == version, f"{agent_type} 版本不一致"
 
 
 def test_macro_subagents_includes_external_only_when_enabled():
