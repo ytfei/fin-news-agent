@@ -30,37 +30,5 @@ services:
       retries: 20
       start_period: 10s
 
-  # 后端：API + 调度器 + worker 三合一
-  app:
-    build: .
-    container_name: fin-news-app
-    restart: unless-stopped
-    env_file: .env
-    environment:
-      # 容器内通过服务名访问 db，端口是容器内 5432（覆盖 .env 里的 localhost:5433）
-      POSTGRES_HOST: db
-      POSTGRES_PORT: 5432
-    depends_on:
-      db:
-        condition: service_healthy
-    ports:
-      - "8000:8000"
-    healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health', timeout=3)\""]
-      interval: 15s
-      timeout: 5s
-      retries: 10
-      start_period: 40s
-
-  # 前端：nginx 托管静态资源 + /api 反代到 app
-  web:
-    build: ./web
-    container_name: fin-news-web
-    restart: unless-stopped
-    depends_on:
-      - app
-    ports:
-      - "80:80"
-
 volumes:
   pgdata:

@@ -56,10 +56,12 @@ export function Timeline() {
 
   const news = useQuery({
     queryKey: ['news', minScore, sort],
-    queryFn: () =>
-      api.get<Page<NewsItem>>(
-        `/news?sort=${sort}&min_score=${minScore}&page=1&page_size=50`,
-      ),
+    queryFn: () => {
+      const params = new URLSearchParams({ sort, page: '1', page_size: '50' });
+      // 后端 min_score 约束 ge=1，「全部」时不传该参数（None 表示不过滤）
+      if (minScore > 0) params.set('min_score', String(minScore));
+      return api.get<Page<NewsItem>>(`/news?${params.toString()}`);
+    },
   });
 
   return (
