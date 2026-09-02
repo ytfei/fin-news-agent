@@ -145,10 +145,16 @@ class Settings(BaseSettings):
     analysis_timeout_seconds: int = 300
     # 盘前/盘后简报：走 ReAct 深度分析（多轮工具调用 + 子 agent 并行），
     # 耗时预算比逐条资讯分析更宽松
-    brief_timeout_seconds: int = 600
+    brief_timeout_seconds: int = 1800
     # ReAct 循环步数上限（LangGraph 按节点计数，子 agent 内部也计步）。
     # LangGraph 默认 10007 等于没有上限、纯靠超时兜底，深度场景需显式收紧。
-    agent_recursion_limit: int = 80
+    agent_recursion_limit: int = 200
+    # 步骤级追踪：把 ReAct 每一步（工具调用 / 子 agent / LLM 往返）的名称、
+    # 入参摘要与耗时打到日志。日志随执行实时输出，因此超时时也能看到最后停在哪一步。
+    # 默认关闭：深度场景单次运行可达数十步，全程开启会显著刷屏。
+    agent_trace_enabled: bool = True
+    # 单条追踪日志里「入参 / 结果」摘要的最大字符数（防止长文刷屏）
+    agent_trace_max_chars: int = 300
 
     # 评分 / 分析的实现层：langgraph 走 LangGraph 图 + 原生结构化输出，
     # legacy 走自研 llm/client.py；langgraph 失败会自动回退 legacy

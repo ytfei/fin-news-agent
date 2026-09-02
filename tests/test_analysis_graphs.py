@@ -183,7 +183,20 @@ async def test_run_analysis_passes_recursion_limit():
     graph = _FakeGraph({"messages": [], "structured_response": None})
     await run_analysis(AgentType.STOCK, "提示", _settings(agent_recursion_limit=50), graph=graph)
     assert graph.calls, "图未被调用"
-    assert graph.calls[0]["config"] == {"recursion_limit": 50}
+    assert graph.calls[0]["config"]["recursion_limit"] == 50
+
+
+async def test_run_analysis_callbacks_only_when_trace_enabled():
+    """步骤追踪是可选的：关闭时不能往 config 里塞 callbacks（避免无谓开销）。"""
+    off = _FakeGraph({"messages": [], "structured_response": None})
+    await run_analysis(AgentType.STOCK, "提示", _settings(agent_trace_enabled=False), graph=off)
+    assert "callbacks" not in off.calls[0]["config"]
+
+    on = _FakeGraph({"messages": [], "structured_response": None})
+    await run_analysis(AgentType.STOCK, "提示", _settings(agent_trace_enabled=True), graph=on)
+    callbacks = on.calls[0]["config"].get("callbacks") or []
+    assert len(callbacks) == 1
+    assert callbacks[0].steps == 0
 
 
 # ------------------------------ 盘前 / 盘后子 agent ------------------------------

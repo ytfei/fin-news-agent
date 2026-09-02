@@ -30,7 +30,7 @@ from fin_news.agents.tools.market_data import (
 from fin_news.core.config import Settings, get_settings
 from fin_news.core.db import session_scope
 from fin_news.core.enums import AgentType, MarketPeriod, ReportStatus
-from fin_news.core.logging import get_logger
+from fin_news.core.logging import get_logger, stage
 from fin_news.core.timeutil import now, now_utc
 from fin_news.models.analysis import AnalysisReport
 
@@ -84,13 +84,18 @@ async def _build_brief(
         else (POST_MARKET_SYSTEM, POST_MARKET_USER_TEMPLATE, POST_MARKET_VERSION)
     )
 
-    context = await _build_context(session, trade_date, period, settings)
+    # 分阶段计时：简报链路没有事件化重试，出问题时只能靠日志定位慢在哪一段
+    async with stage(logger, "预取上下文", period=period.value) as out:
+        context = await _build_context(session, trade_date, period, settings)
+        out["news"] = len(context.get("_news_ids") or [])
+
     # 内部字段不进模板
     template_ctx = {k: v for k, v in context.items() if not k.startswith("_")}
 
-    output: AgentOutput = await _run_brief_agent(
-        agent_type, system_prompt, user_template.format(**template_ctx), settings
-    )
+    async with stage(logger, "执行简报 Agent", period=period.value, agent=agent_type.value):
+        output: AgentOutput = await _run_brief_agent(
+            agent_type, system_prompt, user_template.format(**template_ctx), settings
+        )
 
     report = await _persist_brief(session, trade_date, period, agent_type, version, output, context)
     logger.info(
@@ -129,6 +134,12 @@ async def _run_brief_agent(
                 timeout_seconds=settings.brief_timeout_seconds,
             )
             if run.payload is not None:
+                logger.info(
+                    "简报 Agent 走 DeepAgents 路径",
+                    agent=agent_type.value,
+                    latency_ms=run.latency_ms,
+                    tokens=(run.prompt_tokens or 0) + (run.completion_tokens or 0),
+                )
                 return AgentOutput(
                     data=run.payload.model_dump(),
                     model=run.model,

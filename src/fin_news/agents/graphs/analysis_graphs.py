@@ -390,17 +390,44 @@ async def run_analysis(
     started = time.perf_counter()
     compiled = graph if graph is not None else get_analysis_graph(agent_type, settings)
 
+    config: dict[str, Any] = {"recursion_limit": limit}
+    trace: StepTraceHandler | None = None
+    if settings.agent_trace_enabled:
+        from fin_news.agents.llm.callbacks import StepTraceHandler
+
+        trace = StepTraceHandler(agent=agent_type.value, max_chars=settings.agent_trace_max_chars)
+        config["callbacks"] = [trace]
+
+    logger.info(
+        "分析图执行开始",
+        agent=agent_type.value,
+        timeout_seconds=timeout,
+        recursion_limit=limit,
+        trace=trace is not None,
+    )
+
     try:
         result = await asyncio.wait_for(
-            compiled.ainvoke(
-                {"messages": [HumanMessage(content=user_prompt)]},
-                config={"recursion_limit": limit},
-            ),
+            compiled.ainvoke({"messages": [HumanMessage(content=user_prompt)]}, config=config),
             timeout=timeout,
         )
     except TimeoutError:
+        logger.warning(
+            "分析图执行超时",
+            agent=agent_type.value,
+            elapsed_ms=int((time.perf_counter() - started) * 1000),
+            timeout_seconds=timeout,
+            steps=trace.steps if trace else None,
+        )
         return AnalysisRun(latency_ms=int((time.perf_counter() - started) * 1000), error="timeout")
     except Exception as exc:  # noqa: BLE001 - 图执行失败（含结构化输出不支持）
+        logger.warning(
+            "分析图执行失败",
+            agent=agent_type.value,
+            elapsed_ms=int((time.perf_counter() - started) * 1000),
+            steps=trace.steps if trace else None,
+            error=f"{type(exc).__name__}: {str(exc)[:300]}",
+        )
         return AnalysisRun(
             latency_ms=int((time.perf_counter() - started) * 1000),
             error=f"{type(exc).__name__}: {str(exc)[:300]}",
@@ -415,10 +442,19 @@ async def run_analysis(
             payload = None
 
     prompt_tokens, completion_tokens = _usage_of(result)
+    latency_ms = int((time.perf_counter() - started) * 1000)
+    logger.info(
+        "分析图执行结束",
+        agent=agent_type.value,
+        latency_ms=latency_ms,
+        messages=len(result.get("messages") or []),
+        steps=trace.steps if trace else None,
+        structured=payload is not None,
+    )
     return AnalysisRun(
         payload=payload,
         model=_model_of(result),
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
-        latency_ms=int((time.perf_counter() - started) * 1000),
+        latency_ms=latency_ms,
     )

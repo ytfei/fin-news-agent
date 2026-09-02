@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import json
 import time
 import uuid
 from typing import Any
@@ -17,6 +18,7 @@ from fin_news.core.logging import get_logger
 from fin_news.models.event import LLMCallLog
 
 logger = get_logger("agents.llm.callbacks")
+trace_logger = get_logger("agents.trace")
 
 # 粗略成本估算（分/千 token），与 client.py 保持一致
 _PRICE_PER_1K_CENT = {
@@ -130,6 +132,123 @@ class AuditCallbackHandler(AsyncCallbackHandler):
                 )
         except Exception as exc:  # noqa: BLE001 - 审计失败不能影响主流程
             logger.warning("写入模型调用日志失败", error=str(exc)[:200])
+
+
+class StepTraceHandler(AsyncCallbackHandler):
+    """步骤级追踪：把 ReAct 每一步（工具调用 / 子 agent / LLM 往返）打到日志。
+
+    与 AuditCallbackHandler 的分工：
+    * AuditCallbackHandler 挂在 ChatModel 上，负责**落库审计**（llm_call_log）
+    * StepTraceHandler 挂在单次 ainvoke 上，负责**实时可观测**（回答「卡在哪一步」）
+
+    日志随执行实时输出（structlog 直接写 stdout，不缓冲），所以即使最终超时
+    被 asyncio.wait_for 取消，也能看到最后停在哪一次调用上——这正是排查
+    「600 秒跑完却不知道干了什么」的关键。
+
+    状态一律按 run_id 隔离，可安全并发复用（子 agent 是并行的）。
+    """
+
+    def __init__(self, agent: str = "", max_chars: int = 300) -> None:
+        self.agent = agent
+        self.max_chars = max_chars
+        self._seq = 0
+        self._llm: dict[str, tuple[float, str]] = {}  # run_id -> (started, model)
+        self._tool: dict[str, tuple[float, str]] = {}  # run_id -> (started, name)
+
+    # ------------------------------------------------------------------
+    @property
+    def steps(self) -> int:
+        """已发起的步骤数（LLM 往返 + 工具调用）。超时日志带上它，可看出是否原地空转。"""
+        return self._seq
+
+    def _next_step(self) -> int:
+        self._seq += 1
+        return self._seq
+
+    def _clip(self, value: Any) -> str:
+        text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
+        text = " ".join(text.split())
+        return text[: self.max_chars]
+
+    # ------------------------------------------------------------------
+    async def on_llm_start(self, serialized: dict[str, Any], prompts: list[str], **kwargs: Any) -> None:
+        run_id = str(kwargs.get("run_id") or "")
+        model = (serialized or {}).get("kwargs", {}).get("model") or ""
+        self._llm[run_id] = (time.perf_counter(), model)
+        trace_logger.info(
+            "→ LLM 调用",
+            agent=self.agent,
+            step=self._next_step(),
+            model=model,
+            prompt=prompts[0][: self.max_chars] if prompts else "",
+        )
+
+    async def on_llm_end(self, response: LLMResult, **kwargs: Any) -> None:
+        run_id = str(kwargs.get("run_id") or "")
+        started, model = self._llm.pop(run_id, (None, ""))
+        latency_ms = int((time.perf_counter() - started) * 1000) if started else None
+        prompt_tokens, completion_tokens, _estimated = _extract_usage(response)
+        trace_logger.info(
+            "← LLM 返回",
+            agent=self.agent,
+            model=model or _model_of(response),
+            latency_ms=latency_ms,
+            tokens=(prompt_tokens or 0) + (completion_tokens or 0),
+        )
+
+    async def on_llm_error(self, error: BaseException, **kwargs: Any) -> None:
+        run_id = str(kwargs.get("run_id") or "")
+        started, model = self._llm.pop(run_id, (None, ""))
+        trace_logger.warning(
+            "← LLM 失败",
+            agent=self.agent,
+            model=model,
+            latency_ms=int((time.perf_counter() - started) * 1000) if started else None,
+            error=str(error)[:200],
+        )
+
+    # ------------------------------------------------------------------
+    async def on_tool_start(self, serialized: dict[str, Any], input_str: str, **kwargs: Any) -> None:
+        run_id = str(kwargs.get("run_id") or "")
+        name = (serialized or {}).get("name") or "tool"
+        self._tool[run_id] = (time.perf_counter(), name)
+        trace_logger.info(
+            "→ 工具",
+            agent=self.agent,
+            step=self._next_step(),
+            tool=name,
+            args=self._clip(input_str),
+        )
+
+    async def on_tool_end(self, output: Any, **kwargs: Any) -> None:
+        run_id = str(kwargs.get("run_id") or "")
+        started, name = self._tool.pop(run_id, (None, "tool"))
+        trace_logger.info(
+            "← 工具",
+            agent=self.agent,
+            tool=name,
+            latency_ms=int((time.perf_counter() - started) * 1000) if started else None,
+            result=self._clip(getattr(output, "content", output)),
+        )
+
+    async def on_tool_error(self, error: BaseException, **kwargs: Any) -> None:
+        run_id = str(kwargs.get("run_id") or "")
+        _started, name = self._tool.pop(run_id, (None, "tool"))
+        trace_logger.warning("← 工具失败", agent=self.agent, tool=name, error=str(error)[:200])
+
+
+def _model_of(response: LLMResult) -> str:
+    """从 LLMResult 里尽力取模型名（不同 LangChain 版本结构不同）。"""
+    try:
+        for generations in getattr(response, "generations", None) or []:
+            for gen in generations:
+                meta = getattr(gen, "message", None)
+                meta = getattr(meta, "response_metadata", None) or {}
+                if meta.get("model_name"):
+                    return str(meta["model_name"])
+    except Exception:  # noqa: BLE001 - 取不到就用空串，不影响追踪主流程
+        pass
+    return ""
 
 
 def _extract_usage(response: LLMResult) -> tuple[int, int, bool]:

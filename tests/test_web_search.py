@@ -405,9 +405,11 @@ def test_format_results_numbers_all_hits():
 # ------------------------------ LangChain 工具包装 ------------------------------
 
 
-async def test_langchain_tool_degrades_when_disabled():
+async def test_langchain_tool_degrades_when_disabled(monkeypatch):
     from fin_news.agents.tools.langchain_tools import web_search as lc_tool
 
+    # 包装层走 get_settings() 全局单例，必须显式钉死，否则 .env 里开着搜索就会真发请求
+    monkeypatch.setattr(ws, "get_settings", lambda: _settings(web_search_enabled=False))
     out = await lc_tool.ainvoke({"query": "降准", "max_results": 3})
     assert out.startswith("（外部检索不可用：")
 
