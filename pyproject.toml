@@ -34,6 +34,7 @@ dependencies = [
     "tenacity>=9.0",
     "structlog>=24.1",
     "tavily-python>=0.8.0",
+    "dspy>=3.3.1",
 ]
 
 # 用 dependency-groups 而不是 optional-dependencies：
