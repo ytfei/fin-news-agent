@@ -9,7 +9,16 @@ doubao-embedding-vision 与旧文本模型（doubao-embedding-text-240715）的�
   （文本/图片/视频混合），返回的是这一个样本的**一个**融合向量 —— 响应 `data`
   字段是对象 `{"embedding": [...]}` 而非 OpenAI 的数组 `[{"embedding": ...}]`。
   因此无法像 OpenAI 那样一次请求批量文本，必须逐条请求（这里用 asyncio.gather
-  并发逐条，分批限流）。
+  并发逐条）。
+
+并发模型：
+* `embedding_batch_size` 已弃用：单条资讯分块通常只有 3~15 块，按资讯分批并发
+  的窗口太小，模型侧 QPS 上不去。现在所有待向量化文本统一汇入一个**进程级
+  信号量闸门**（`embedding_concurrency`），批处理时多条资讯的 chunk 请求共享
+  同一闸门，全局 in-flight 请求数精确受控在模型配额之内，吞吐显著提升。
+* 审计日志攒批：每条 embedding 调用只向进程内 pending 队列追加一条记录，
+  由 `flush_logs()` 一次性批量写库，避免「每条请求一次数据库往返」抢占连接池。
+  `embed_one()`（检索 / QA 查询）保持即时写，行为与旧版一致。
 
 保留自建 Embedder 的原因：
 * 写入前的维度校验（维度不一致必须终止，否则污染向量索引）
@@ -43,6 +52,10 @@ class Embedder:
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or get_settings()
         self._client: httpx.AsyncClient | None = None
+        self._semaphore: asyncio.Semaphore | None = None
+        # 进程内攒批的审计日志；由 flush_logs() 一次批量落库
+        self._pending_logs: list[LLMCallLog] = []
+        self._flush_lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
     @property
@@ -52,7 +65,21 @@ class Embedder:
             self._client = httpx.AsyncClient(timeout=self.settings.llm_timeout_seconds)
         return self._client
 
+    @property
+    def _sem(self) -> asyncio.Semaphore:
+        """进程级并发闸门：同时 in-flight 的 embedding 请求不超过配置上限。
+
+        挂在 Embedder 单例上，批处理时多条资讯的 chunk 请求共享同一闸门；
+        多 worker 进程各自独立，需按「进程数 × embedding_concurrency
+        ≤ 模型侧配额」设定配置。
+        """
+        if self._semaphore is None:
+            self._semaphore = asyncio.Semaphore(max(1, self.settings.embedding_concurrency))
+        return self._semaphore
+
     async def close(self) -> None:
+        """兜底：先批量落库审计日志，再关闭 httpx 连接。"""
+        await self.flush_logs()
         if self._client is not None:
             await self._client.aclose()
             self._client = None
@@ -80,23 +107,42 @@ class Embedder:
         }
 
     # ------------------------------------------------------------------
-    async def embed(self, texts: list[str]) -> list[list[float]]:
+    async def embed(self, texts: list[str], *, auto_flush: bool = True) -> list[list[float]]:
+        """把全部文本放入受限并发池逐条请求（单样本语义，不可请求内批量）。
+
+        任一条请求失败会等其余请求完成后再抛错（结果丢弃），保证调用方拿到的
+        永远是「全部成功」的向量或一个明确异常，不会出现半批状态。
+        默认结束后批量落库审计日志；批处理场景传 auto_flush=False，由批次
+        结束统一 flush 一次，避免每条请求一次数据库往返。
+        """
         if not texts:
             return []
         model = self.settings.model_for(self.settings.embedding_provider, "embedding")
-        vectors: list[list[float]] = []
-        batch_size = max(1, self.settings.embedding_batch_size)
-
-        # 单样本语义：逐条请求，用 gather 分批并发限流
-        for i in range(0, len(texts), batch_size):
-            batch = [t.replace("\n", " ").strip() or " " for t in texts[i : i + batch_size]]
-            vectors.extend(await asyncio.gather(*(self._embed_one(t) for t in batch)))
-
-        self._validate(vectors)
-        logger.debug("embedding 完成", model=model, texts=len(texts), dim=len(vectors[0]) if vectors else 0)
-        return vectors
+        cleaned = [t.replace("\n", " ").strip() or " " for t in texts]
+        try:
+            raw = await asyncio.gather(
+                *(self._embed_one(t) for t in cleaned), return_exceptions=True
+            )
+            first_error = next((r for r in raw if isinstance(r, BaseException)), None)
+            if first_error is not None:
+                raise first_error
+            vectors: list[list[float]] = list(raw)  # type: ignore[arg-type]
+            self._validate(vectors)
+            logger.debug(
+                "embedding 完成", model=model, texts=len(texts), dim=len(vectors[0]) if vectors else 0
+            )
+            return vectors
+        finally:
+            # 成功与失败路径都落审计（失败已 append 过 ERROR 日志）
+            if auto_flush:
+                await self.flush_logs()
 
     async def _embed_one(self, text: str) -> list[float]:
+        """单条 embedding 请求（受进程级闸门限流）。"""
+        async with self._sem:
+            return await self._request(text)
+
+    async def _request(self, text: str) -> list[float]:
         url, headers = self._endpoint()
         model = self.settings.model_for(self.settings.embedding_provider, "embedding")
         started = time.perf_counter()
@@ -107,18 +153,21 @@ class Embedder:
             vec = self._parse_response(data)
         except Exception as exc:  # noqa: BLE001
             latency_ms = int((time.perf_counter() - started) * 1000)
-            await self._log_call(model=model, prompt_tokens=0, latency_ms=latency_ms,
-                                 status="ERROR", error=str(exc)[:500])
+            self._log_call(
+                model=model, prompt_tokens=0, latency_ms=latency_ms,
+                status="ERROR", error=str(exc)[:500],
+            )
             raise
 
         usage = data.get("usage") or {}
         prompt_tokens = int(usage.get("input_tokens") or usage.get("total_tokens") or 0)
         latency_ms = int((time.perf_counter() - started) * 1000)
-        await self._log_call(model=model, prompt_tokens=prompt_tokens, latency_ms=latency_ms,
-                             status="OK")
+        self._log_call(
+            model=model, prompt_tokens=prompt_tokens, latency_ms=latency_ms, status="OK"
+        )
         return vec
 
-    async def _log_call(
+    def _log_call(
         self,
         *,
         model: str,
@@ -127,27 +176,40 @@ class Embedder:
         status: str,
         error: str | None = None,
     ) -> None:
-        """写一次 embedding 调用到 llm_call_log（审计与成本）。"""
+        """向进程内队列追加一条 embedding 审计（不立即写库）。"""
+        self._pending_logs.append(
+            LLMCallLog(
+                trace_id=uuid.uuid4().hex[:16],
+                provider=self.settings.embedding_provider,
+                role="embedding",
+                model=model,
+                is_fallback=False,
+                request_chars=0,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=0,
+                latency_ms=latency_ms,
+                status=status,
+                error_message=error,
+                cost_cent=round(prompt_tokens / 1000 * _EMBEDDING_PRICE_PER_1K_CENT, 4),
+            )
+        )
+
+    async def flush_logs(self) -> None:
+        """把攒批的审计日志一次性写库。
+
+        幂等；写库失败只告警（与旧版语义一致，审计不能阻断向量化主流程）。
+        并发 flush 时由锁串行化，先到者取走全部 pending，后到者发现为空即返回。
+        """
+        async with self._flush_lock:
+            if not self._pending_logs:
+                return
+            logs = self._pending_logs
+            self._pending_logs = []
         try:
             async with session_scope() as session:
-                session.add(
-                    LLMCallLog(
-                        trace_id=uuid.uuid4().hex[:16],
-                        provider=self.settings.embedding_provider,
-                        role="embedding",
-                        model=model,
-                        is_fallback=False,
-                        request_chars=0,
-                        prompt_tokens=prompt_tokens,
-                        completion_tokens=0,
-                        latency_ms=latency_ms,
-                        status=status,
-                        error_message=error,
-                        cost_cent=round(prompt_tokens / 1000 * _EMBEDDING_PRICE_PER_1K_CENT, 4),
-                    )
-                )
+                session.add_all(logs)
         except Exception as exc:  # noqa: BLE001 - 审计失败不能影响主流程
-            logger.warning("写入 embedding 调用日志失败", error=str(exc)[:200])
+            logger.warning("批量写入 embedding 审计日志失败", count=len(logs), error=str(exc)[:200])
 
     @staticmethod
     def _parse_response(data: dict[str, Any]) -> list[float]:
@@ -155,7 +217,8 @@ class Embedder:
         return data["data"]["embedding"]
 
     async def embed_one(self, text: str) -> list[float]:
-        vecs = await self.embed([text])
+        """单条向量（检索/QA 查询路径）。审计即时写，行为与旧版一致。"""
+        vecs = await self.embed([text], auto_flush=True)
         return vecs[0] if vecs else []
 
     # ------------------------------------------------------------------

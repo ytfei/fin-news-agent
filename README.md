@@ -21,8 +21,8 @@
 | REST API | `/health`、`/news`、`/news/{id}`、`/analysis`、`/market/*`、`/chat/sessions`、`/admin/*` 均正常 |
 | 单元测试 `pytest` | 129 passed |
 | 静态检查 `ruff` | All checks passed |
-| **评分** | 已实跑：火山 `doubao-seed-2-0-mini` 批量打分，30 条/批约 12–45s |
-| **向量化** | 已实跑：`doubao-embedding-vision`（多模态接口 `/embeddings/multimodal`），2048 维，列类型 `halfvec(2048)` + HNSW |
+| **评分** | 已实跑：火山 `doubao-seed-2-0-mini`；30 条/批拆 3×10 子批并发（`SCORING_SUB_BATCH_SIZE` × `SCORING_CONCURRENCY`），整批约 12–45s |
+| **向量化** | 已实跑：`doubao-embedding-vision`（多模态接口 `/embeddings/multimodal`）；一批资讯的全部 chunk 汇入 `EMBEDDING_CONCURRENCY` 闸门并发逐条请求，审计日志攒批落库 |
 | **深度分析** | 已实跑：个股 / 行业 Agent 产出结构化报告（含受益板块、龙头、估值、逻辑链） |
 | **语义检索** | 已验证：同事件跨源相似度 0.92，无关资讯 0.70 |
 

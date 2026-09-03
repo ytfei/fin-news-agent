@@ -167,6 +167,9 @@ async def _cmd_embed(limit: int | None = None) -> int:
     """直接向量化已评分的资讯，不依赖事件队列。
 
     用途：补数、事件已 DONE 但资讯未向量化、或只想验证 embedding 链路。
+    与事件驱动共享 chunk_news / embed_news_batch / write_chunks：整批资讯先
+    纯函数分块，再有分块的统一受限并发 embedding，最后逐条落库提交（已完成
+    的结果立即可见）。
     """
     from sqlalchemy import select
 
@@ -176,7 +179,11 @@ async def _cmd_embed(limit: int | None = None) -> int:
     from fin_news.domain.scoring import should_vectorize
     from fin_news.events.bus import EventBus
     from fin_news.models.news import NewsItem
-    from fin_news.pipeline.handlers.on_scored import vectorize_news
+    from fin_news.pipeline.handlers.on_scored import (
+        chunk_news,
+        embed_news_batch,
+        write_chunks,
+    )
 
     logger = get_logger(_LOG_NAME)
     settings = get_settings()
@@ -203,18 +210,64 @@ async def _cmd_embed(limit: int | None = None) -> int:
             logger.info("没有待向量化的资讯（要求 status=SCORED/EMBED_FAILED 且 score 非空）")
             return 0
 
-        bus = EventBus(session, worker_id="cli-embed")
+        # 预检 + 纯函数分块（无 DB / 网络 IO）
+        plan: list[tuple[NewsItem, list[str]]] = []
         for news in items:
             if not should_vectorize(news.score, settings.score_threshold_vectorize):
                 news.status = NewsStatus.ARCHIVED_NOISE
                 news.analysis_status = "NONE"
                 skipped += 1
                 continue
+            plan.append((news, chunk_news(news, settings)))
+
+        # 有分块的整批受限并发 embedding（不占业务会话；失败资讯在阶段 3 隔离）
+        with_chunks = [(news, chunks) for news, chunks in plan if chunks]
+        results: dict[int, list[list[float]] | BaseException] = {}
+        if with_chunks:
+            results = await embed_news_batch(with_chunks, settings)
+
+        # 逐条落库 + 提交（SAVEPOINT 隔离单条写入失败；已完成的结果立即可见）
+        bus = EventBus(session, worker_id="cli-embed")
+        for news, chunks in plan:
+            if not chunks:
+                # 空正文：无内容可分块，仍按成功推进（与 vectorize_news 返回 0 一致）
+                news.status = NewsStatus.EMBEDDED
+                news.analysis_status = "PENDING"
+                news.last_error = None
+                logger.info("已向量化（空正文，无分块）", news_id=news.id)
+                await bus.publish(
+                    EventType.NEWS_EMBEDDED,
+                    news.id,
+                    payload={"score": news.score, "band": news.band.value if news.band else None},
+                    priority=2,
+                )
+                embedded += 1
+                await session.commit()
+                continue
+
+            outcome = results.get(news.id)
+            if outcome is None:
+                news.status = NewsStatus.EMBED_FAILED
+                news.retry_count = (news.retry_count or 0) + 1
+                news.last_error = "embedding 结果缺失（内部错误）"
+                failed += 1
+                continue
+            if isinstance(outcome, BaseException):
+                news.status = NewsStatus.EMBED_FAILED
+                news.retry_count = (news.retry_count or 0) + 1
+                news.last_error = str(outcome)[:500]
+                failed += 1
+                logger.error(
+                    "向量化失败",
+                    news_id=news.id,
+                    error=f"{type(outcome).__name__}: {str(outcome)[:200]}",
+                )
+                continue
 
             try:
                 # 用 SAVEPOINT 隔离单条失败，避免脏写入留在事务里
                 async with session.begin_nested():
-                    chunks = await vectorize_news(session, news, settings)
+                    await write_chunks(session, news, chunks, outcome, settings)
             except DimensionMismatch as exc:
                 logger.error("向量维度不匹配，终止", error=str(exc))
                 return 1
@@ -228,7 +281,7 @@ async def _cmd_embed(limit: int | None = None) -> int:
             news.status = NewsStatus.EMBEDDED
             news.analysis_status = "PENDING"
             news.last_error = None
-            logger.info("已向量化", news_id=news.id, chunks=chunks, score=news.score)
+            logger.info("已向量化", news_id=news.id, chunks=len(chunks), score=news.score)
             await bus.publish(
                 EventType.NEWS_EMBEDDED,
                 news.id,
@@ -236,7 +289,6 @@ async def _cmd_embed(limit: int | None = None) -> int:
                 priority=2,
             )
             embedded += 1
-            # 逐条提交：量大时已完成的结果立即可见
             await session.commit()
 
     logger.info("向量化完成", embedded=embedded, skipped=skipped, failed=failed)

@@ -84,3 +84,13 @@ def test_env_prefix_is_not_used():
     assert os.environ.get("FIN_NEWS_APP_NAME") is None
     s = Settings(_env_file=None)
     assert s.env in {"dev", "test", "prod", "staging", "local"}
+
+
+def test_score_and_embed_concurrency_defaults(monkeypatch):
+    """小批并发新增配置必须提供合理的进程内默认值。"""
+    for key in ("SCORING_SUB_BATCH_SIZE", "EMBEDDING_CONCURRENCY"):
+        monkeypatch.delenv(key, raising=False)
+    s = Settings(_env_file=None)
+    assert s.scoring_sub_batch_size == 10
+    assert s.embedding_concurrency == 16
+    assert s.embedding_batch_size == 32  # 已弃用但保留兼容 .env

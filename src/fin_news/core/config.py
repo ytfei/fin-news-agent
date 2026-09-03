@@ -109,6 +109,8 @@ class Settings(BaseSettings):
     scoring_window_seconds: int = 15
     scoring_max_content_chars: int = 800
     scoring_concurrency: int = 4
+    # 评分子批条数：整批资讯按此切片并发评分（小批输出更快、漏评可局部补打）
+    scoring_sub_batch_size: int = 10
     # score > 该阈值才做向量化与深度分析（(0,3] 为噪声）
     score_threshold_vectorize: int = 3
 
@@ -117,7 +119,10 @@ class Settings(BaseSettings):
     # 可选 1024 / 2048（旧文本模型 doubao-embedding-text-240715 固定 2560 维，已弃用）
     embedding_provider: ProviderName = "volcengine"
     embedding_dim: int = 2048
+    # 已弃用：旧版以该值分批并发 embedding；现由 embedding_concurrency 统一限流，保留以兼容 .env
     embedding_batch_size: int = 32
+    # embedding HTTP 请求的进程级并发上限（火山 multimodal 单样本语义只能逐条请求，靠并发提吞吐）
+    embedding_concurrency: int = 16
 
     # ---------------- LLM ----------------
     llm_default_provider: ProviderName = "volcengine"

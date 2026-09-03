@@ -1,6 +1,17 @@
-"""评分 Agent：使用轻量 flash 模型对一批资讯批量打分（1-10）。"""
+"""评分 Agent：小批并发调用轻量 flash 模型对资讯打分（1-10）。
+
+性能策略：整批资讯（默认 30 条）按 `scoring_sub_batch_size`（默认 10）切成
+小子批，经 `scoring_concurrency` 信号量限流并发执行 LangGraph 评分（失败回退
+该子批 legacy），各子批保留独立的 rescue / 退化护栏，最后按原始顺序合并结果，
+统一落库与补发下游事件。
+
+相比「整批 30 条一次大 JSON 生成」：
+* 单批墙钟从单次大调用时长降为最大子批耗时（默认 3 个子批全并行）；
+* 输出条数少，生成更稳、更不易超时，漏评只补打对应子批。
+"""
 from __future__ import annotations
 
+import asyncio
 import uuid
 
 from sqlalchemy import select
@@ -45,7 +56,7 @@ class ScoringAgent:
         return len(items)
 
     async def score_items(self, session: AsyncSession, items: list[NewsItem]) -> dict[int, ScoreItemResult]:
-        """评分入口：按 agent_framework 选择实现，langgraph 失败自动回退 legacy。"""
+        """评分入口：整批按小子批切片并发评分，按原始顺序合并结果后落库。"""
         if not items:
             return {}
         if not self.settings.has_llm_credentials():
@@ -62,42 +73,25 @@ class ScoringAgent:
             model=self.settings.model_for(self.settings.llm_default_provider, "scoring"),
             news_ids=[i.id for i in items][:20],
         ) as out:
-            result: ScoreBatchResult | None = None
+            subs = self._split_subs(items)
+            semaphore = get_semaphore("scoring", self.settings)
 
-            if self.settings.agent_framework == "langgraph":
-                try:
-                    # 经 registry 拿缓存图：统一入口，框架细节对业务层透明
-                    graph = get_agent(AgentType.SCORING, self.settings)
-                    run = await run_scoring(items, self.settings, graph=graph)
-                except Exception as exc:  # noqa: BLE001 - 图执行失败（含超时）回退 legacy
-                    logger.warning(
-                        "LangGraph 评分失败，回退 legacy 调用", count=len(items), error=str(exc)[:300]
-                    )
-                    run = None
+            async def _run_sub(sub: list[NewsItem]) -> ScoreBatchResult:
+                # 调用方已持有信号量（scoring 并发上限 = 同时 in-flight 的子批数），
+                # legacy 回退内部不再重复占用槽位
+                async with semaphore:
+                    return await self._score_sub_batch(sub)
 
-                if run is not None and run.items:
-                    result = self._run_to_batch_result(run)
-                    out["path"] = "langgraph"
-                    logger.info(
-                        "评分完成（langgraph）",
-                        total=len(items),
-                        scored=len(run.items),
-                        model=run.model,
-                        rounds=run.rounds,
-                        latency_ms=run.latency_ms,
-                        prompt_tokens=run.prompt_tokens,
-                        completion_tokens=run.completion_tokens,
-                    )
-                    if self.settings.score_dual_run:
-                        await self._compare_with_legacy(items, expected_ids, run)
-                elif run is not None:
-                    logger.warning(
-                        "LangGraph 未产出任何评分，回退 legacy", error=run.error, rounds=run.rounds
-                    )
-
-            if result is None:
-                result = await self._score_legacy(items, expected_ids)
-                out["path"] = "legacy"
+            sub_results = await asyncio.gather(
+                *(_run_sub(s) for s in subs), return_exceptions=True
+            )
+            result = self._merge_sub_results(items, subs, sub_results)
+            out["path"] = (
+                self.settings.agent_framework
+                if len(subs) == 1
+                else f"{self.settings.agent_framework}-subbatch"
+            )
+            out["sub_batches"] = len(subs)
 
             if not result.items:
                 for item in items:
@@ -106,6 +100,10 @@ class ScoringAgent:
                     item.last_error = "评分失败：模型未返回可解析结果"
                 out.update(scored=0, missing=len(items), result="模型未返回可解析结果")
                 return {}
+
+            # 双跑灰度（默认关闭）：整批 legacy 再跑一遍，只记录差异不影响入库
+            if self.settings.score_dual_run and self.settings.agent_framework == "langgraph":
+                await self._compare_with_legacy(items, expected_ids, result)
 
             batch_id = uuid.uuid4().hex[:16]
             await self._persist(session, items, result, batch_id)
@@ -143,10 +141,134 @@ class ScoringAgent:
         return published
 
     # ------------------------------------------------------------------
-    async def _score_legacy(self, items: list[NewsItem], expected_ids: set[int]) -> ScoreBatchResult:
-        """原实现：单次 JSON 调用 + 容错解析。"""
+    # 子批切分与执行
+    # ------------------------------------------------------------------
+    def _split_subs(self, items: list[NewsItem]) -> list[list[NewsItem]]:
+        """按 scoring_sub_batch_size 连续切片；不足整批时保持单子批。"""
+        size = max(1, int(self.settings.scoring_sub_batch_size))
+        ordered = list(items)
+        if len(ordered) <= size:
+            return [ordered]
+        return [ordered[i : i + size] for i in range(0, len(ordered), size)]
+
+    async def _score_sub_batch(self, items: list[NewsItem]) -> ScoreBatchResult:
+        """单个子批的完整评分流程：langgraph 优先，空/异常回退该子批 legacy。
+
+        子批内编号重新从 1..k 开始，映射到真实 news_id 的解析逻辑天然支持，
+        因此子批之间互不影响。调用方应已持有 scoring 信号量（并发上限）。
+        """
+        expected_ids = {i.id for i in items}
+        if not items:
+            return ScoreBatchResult()
+
+        if self.settings.agent_framework == "langgraph":
+            run: ScoringRun | None = None
+            try:
+                # 经 registry 拿缓存图：统一入口，框架细节对业务层透明
+                graph = get_agent(AgentType.SCORING, self.settings)
+                run = await run_scoring(items, self.settings, graph=graph)
+            except Exception as exc:  # noqa: BLE001 - 图执行失败（含超时）回退 legacy
+                logger.warning(
+                    "LangGraph 评分失败，子批回退 legacy",
+                    count=len(items),
+                    error=str(exc)[:300],
+                )
+            if run is not None and run.items:
+                logger.info(
+                    "子批评分完成（langgraph）",
+                    total=len(items),
+                    scored=len(run.items),
+                    model=run.model,
+                    rounds=run.rounds,
+                    latency_ms=run.latency_ms,
+                    prompt_tokens=run.prompt_tokens,
+                    completion_tokens=run.completion_tokens,
+                )
+                return self._run_to_batch_result(run)
+            if run is not None:
+                logger.warning(
+                    "LangGraph 子批未产出任何评分，回退 legacy",
+                    error=run.error,
+                    rounds=run.rounds,
+                )
+
+        # legacy 回退：已处于 scoring 信号量保护内，locked=True 防止重复占用槽位
+        return await self._score_legacy(items, expected_ids, locked=True)
+
+    def _merge_sub_results(
+        self,
+        items: list[NewsItem],
+        subs: list[list[NewsItem]],
+        results: list[ScoreBatchResult | BaseException],
+    ) -> ScoreBatchResult:
+        """把各子批结果按原始顺序合并为整批结果。
+
+        * items 顺序稳定（落库 / 补发事件按旧语义遍历）
+        * latency_ms 取子批最大值（单批墙钟下界），token 累计
+        * is_suspect 双重判定：任一子批 suspect 或整批同分集中（跨子批兜底）
+        * 异常子批视为未评分，由 _persist 将对应资讯标 SCORE_FAILED
+        """
+        model = ""
+        latency_ms = 0
+        prompt_tokens = 0
+        completion_tokens = 0
+        suspect = False
+        by_id: dict[int, ScoreItemResult] = {}
+
+        for res in results:
+            if res is None or isinstance(res, BaseException):
+                logger.warning("评分子批异常，该子批按未评分处理", error=str(res)[:200] if res else "")
+                continue
+            for r in res.items:
+                by_id.setdefault(r.id, r)
+            if res.model and not model:
+                model = res.model
+            latency_ms = max(latency_ms, res.latency_ms)
+            prompt_tokens += res.prompt_tokens
+            completion_tokens += res.completion_tokens
+            suspect = suspect or res.is_suspect
+
+        merged = [by_id[n.id] for n in items if n.id in by_id]
+
+        # 整批兜底：跨子批同分集中（如 3×10 全部同分）同样视为分布异常
+        if len(merged) >= 5:
+            top = max((r.score for r in merged), default=0)
+            ratio = sum(1 for r in merged if r.score == top) / len(merged)
+            suspect = suspect or ratio >= 0.8
+
+        if subs and len(subs) > 1:
+            logger.info(
+                "评分子批合并",
+                sub_batches=len(subs),
+                scored=len(merged),
+                latency_ms=latency_ms,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+            )
+        return ScoreBatchResult(
+            items=merged,
+            model=model,
+            prompt_version=SCORING_VERSION,
+            latency_ms=latency_ms,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            is_suspect=suspect,
+        )
+
+    # ------------------------------------------------------------------
+    async def _score_legacy(
+        self,
+        items: list[NewsItem],
+        expected_ids: set[int],
+        *,
+        locked: bool = False,
+    ) -> ScoreBatchResult:
+        """原实现：单次 JSON 调用 + 容错解析。
+
+        locked=True 表示调用方已持有 scoring 信号量（子批并发场景），内部不再重复占用。
+        """
         payload = self._build_payload(items)
-        return await self._call_with_degradation(payload, expected_ids=expected_ids)
+        return await self._call_with_degradation(payload, expected_ids=expected_ids, locked=locked)
 
     def _run_to_batch_result(self, run: ScoringRun) -> ScoreBatchResult:
         """把图的执行结果转成与 legacy 一致的 ScoreBatchResult。"""
@@ -181,28 +303,31 @@ class ScoringAgent:
         )
 
     async def _compare_with_legacy(
-        self, items: list[NewsItem], expected_ids: set[int], run: ScoringRun
+        self, items: list[NewsItem], expected_ids: set[int], result: ScoreBatchResult
     ) -> None:
-        """双跑对比：再用 legacy 实现跑一遍，只记录差异，不影响入库结果。"""
+        """双跑对比：整批再跑一遍 legacy 实现，只记录差异，不影响入库结果。"""
         try:
             legacy = await self._score_legacy(items, expected_ids)
         except Exception as exc:  # noqa: BLE001 - 对比失败不影响主流程
             logger.warning("双跑对比失败", error=str(exc)[:200])
             return
 
+        primary_by_id = {r.id: r.score for r in result.items}
         legacy_by_id = {r.id: r.score for r in legacy.items}
-        common = set(legacy_by_id) & set(run.items)
+        common = set(legacy_by_id) & set(primary_by_id)
         if not common:
-            logger.warning("评分双跑对比：两版结果无交集", legacy=len(legacy_by_id), langgraph=len(run.items))
+            logger.warning(
+                "评分双跑对比：两版结果无交集", legacy=len(legacy_by_id), langgraph=len(primary_by_id)
+            )
             return
 
-        exact = sum(1 for nid in common if legacy_by_id[nid] == run.items[nid].score)
+        exact = sum(1 for nid in common if legacy_by_id[nid] == primary_by_id[nid])
         band_same = sum(
             1
             for nid in common
-            if band_for_score(legacy_by_id[nid]) == band_for_score(run.items[nid].score)
+            if band_for_score(legacy_by_id[nid]) == band_for_score(primary_by_id[nid])
         )
-        diff = sum(abs(legacy_by_id[nid] - run.items[nid].score) for nid in common) / len(common)
+        diff = sum(abs(legacy_by_id[nid] - primary_by_id[nid]) for nid in common) / len(common)
 
         logger.info(
             "评分双跑对比",
@@ -210,8 +335,8 @@ class ScoringAgent:
             exact_rate=round(exact / len(common), 3),
             band_same_rate=round(band_same / len(common), 3),
             mean_abs_diff=round(diff, 3),
-            langgraph_model=run.model,
-            langgraph_ms=run.latency_ms,
+            langgraph_model=result.model,
+            langgraph_ms=result.latency_ms,
             legacy_ms=legacy.latency_ms,
         )
 
@@ -220,13 +345,17 @@ class ScoringAgent:
         return build_payload(items, self.settings.scoring_max_content_chars)
 
     async def _call_with_degradation(
-        self, payload: str, expected_ids: set[int]
+        self, payload: str, expected_ids: set[int], *, locked: bool = False
     ) -> ScoreBatchResult:
-        """正常批 → 失败拆小批（10 条）→ 返回已成功部分。"""
+        """单次 JSON 调用 + 容错解析；失败返回空结果（由上层标记 SCORE_FAILED）。
+
+        locked=True：调用方已持有 scoring 信号量（子批场景），直接调用不再占用槽位，
+        避免同一协程嵌套获取信号量造成并发上限耗尽。
+        """
         client = get_llm_client(self.settings)
         semaphore = get_semaphore("scoring", self.settings)
 
-        async with semaphore:
+        async def _once() -> ScoreBatchResult:
             try:
                 resp = await client.chat(
                     role="scoring",
@@ -238,9 +367,15 @@ class ScoringAgent:
             except Exception as exc:  # noqa: BLE001
                 logger.error("评分调用失败", error=str(exc)[:300])
                 return ScoreBatchResult()
+            return self._parse(
+                resp.data, resp.model, resp.prompt_tokens, resp.completion_tokens,
+                resp.latency_ms, expected_ids,
+            )
 
-        return self._parse(resp.data, resp.model, resp.prompt_tokens, resp.completion_tokens, resp.latency_ms,
-                           expected_ids)
+        if locked:
+            return await _once()
+        async with semaphore:
+            return await _once()
 
     @staticmethod
     def _parse(

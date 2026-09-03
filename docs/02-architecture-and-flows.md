@@ -95,7 +95,7 @@ fin-news-v5/
 │   │   │   ├── factory.py         # role -> (primary, fallback) ChatModel
 │   │   │   ├── limiter.py         # 全局/Provider 级 QPS + 并发闸门 + 日预算
 │   │   │   └── tracer.py          # token/耗时/成本写 llm_call_log
-│   │   ├── embeddings.py          # Embedding 客户端（批量、维度校验、失败重试）
+│   │   ├── embeddings.py          # Embedding 客户端（进程级并发闸门、维度校验、审计攒批）
 │   │   ├── tools/
 │   │   │   ├── retrieval.py       # 向量/关键词检索历史资讯（history_search）
 │   │   │   ├── market_data.py     # 行情、估值、龙虎榜、财报预告（tushare 取数）
@@ -160,25 +160,30 @@ on_ingested(events)
  1. 攒批：等待 window=15s 或 batch_size=30（先到先触发），同一批只处理 status=NEW 的资讯
  2. 原子占位：UPDATE news_item SET status='SCORING' WHERE id IN (...) AND status='NEW'
  3. 构造批量 prompt：编号 + 标题 + 摘要(正文截断 ~600 字) + 发布时间 + 来源
- 4. 调 flash 模型，response_format=json_schema，输出
+ 4. 子批并发：整批按 SCORING_SUB_BATCH_SIZE（默认 10）切成小子批，子批间经
+    SCORING_CONCURRENCY（默认 4）信号量限流并发调 flash 模型（LangGraph 失败回退
+    该子批 legacy），response_format=json_schema，输出
     {"items":[{"id":int,"score":int,"band":"...","reason":string,
                "tags":[...],"entities":[{"code":"","name":"","type":""}],
-               "confidence":float}]}
+               "confidence":float}]}（子批内编号从 1 重计，映射回真实 news_id）
  5. 校验：缺项/越界/幻觉 id → 该条标记 SCORE_FAILED 进入重试；缺失项单条补打（小批量）
- 6. 写 news_score 记录 + 更新 news_item.status=SCORED
- 7. publish(news.scored)
+ 6. 子批结果按原始顺序合并；跨子批同分集中（≥80%）时整批标记 suspect 兜底
+ 7. 写 news_score 记录 + 更新 news_item.status=SCORED
+ 8. publish(news.scored)
 ```
 
 ### 4.3 向量化流程
 
 ```
-on_scored(event)
- score <= 3  → status=ARCHIVED_NOISE，结束（不向量化、不分析）
- score > 3   → chunking（512-800 token / overlap 80）
-             → 批量 embedding（批 ≤ 64，维度校验）
-             → 事务内 upsert news_chunk（先删后插，保证幂等）
-             → news_item.status=EMBEDDED
-             → publish(news.embedded)
+on_scored(events)   # 一批 news.scored（worker_batch_limit=50）
+ 阶段0 批量预检：score<=3 → ARCHIVED_NOISE + ack；资讯缺失 → ack；无模型 Key → release
+ 阶段1 纯函数分块：整批资讯 chunking（512-800 token / overlap 80），无 DB / 网络 IO
+ 阶段2 受限并发 embedding：全部 chunk 汇入进程级闸门（EMBEDDING_CONCURRENCY，
+      默认 16；火山 multimodal 接口单样本语义，只能逐条请求靠并发提吞吐）
+      逐条请求 + 维度校验；审计日志攒批一次落库（不再每条一次 DB 往返）
+ 阶段3 串行落库：每条资讯事务内先删后插 news_chunk（幂等）→ news_item.status=EMBEDDED
+      → publish(news.embedded)；普通失败仅该条标 EMBED_FAILED（fail 事件可重试），
+      DimensionMismatch 整批回滚终止（防污染向量索引）
 ```
 
 ### 4.4 深度分析流程
@@ -330,7 +335,7 @@ llm:
 
 - **事件消费**：worker 每次 `SELECT ... WHERE status='PENDING' AND available_at<=now() ORDER BY priority DESC, created_at LIMIT 50 FOR UPDATE SKIP LOCKED`，支持多副本水平扩展。
 - **优先级**：宏观(3) > 行业(2) > 个股(1)；盘前/盘后任务优先级最高(5)。
-- **并发闸门**：`analysis` 角色并发上限（默认 8）；`scoring` 批量并发上限（默认 4）；Tushare 全局 QPS（默认 200/分钟，按积分调整）。
+- **并发闸门**：`analysis` 角色并发上限（默认 8）；`scoring` 子批并发上限（默认 4，整批按 `scoring_sub_batch_size` 切小子批并行）；embedding 请求进程级闸门（默认 16，`embedding_batch_size` 已弃用，仅供 `.env` 兼容）；Tushare 全局 QPS（默认 200/分钟，按积分调整）。多 worker 副本时按「进程数 × 并发上限 ≤ 模型侧 QPS/配额」调参。
 - **索引**：`news_item(publish_time DESC)`、`news_item(score DESC, publish_time DESC)`、`news_item(status)` 部分索引、`news_chunk` HNSW（`vector_cosine_ops`, `m=16, ef_construction=64`）、`ingest_event(status, available_at)` 部分索引。
 - **批量**：DB 写入全部走 `bulk` + `ON CONFLICT DO UPDATE`；Embedding 批量 ≤64。
 - **缓存**：API 层对盘前/盘后简报、市场概览做短 TTL（30–60s）缓存。

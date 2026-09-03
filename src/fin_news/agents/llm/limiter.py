@@ -15,7 +15,7 @@ def get_semaphore(role: str, settings: Settings | None = None) -> asyncio.Semaph
             "scoring": settings.scoring_concurrency,
             "analysis": settings.analysis_concurrency,
             "qa": settings.analysis_concurrency,
-            "embedding": settings.scoring_concurrency,
+            "embedding": settings.embedding_concurrency,
         }
         _semaphores[role] = asyncio.Semaphore(max(1, limits.get(role, 2)))
     return _semaphores[role]
