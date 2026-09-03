@@ -108,9 +108,9 @@ class Settings(BaseSettings):
     scoring_batch_size: int = 30
     scoring_window_seconds: int = 15
     scoring_max_content_chars: int = 800
-    scoring_concurrency: int = 4
+    scoring_concurrency: int = 10
     # 评分子批条数：整批资讯按此切片并发评分（小批输出更快、漏评可局部补打）
-    scoring_sub_batch_size: int = 10
+    scoring_sub_batch_size: int = 5
     # score > 该阈值才做向量化与深度分析（(0,3] 为噪声）
     score_threshold_vectorize: int = 3
 
@@ -167,7 +167,7 @@ class Settings(BaseSettings):
     # 双跑对比：两套实现各跑一次，只记录差异，不影响入库结果（临时灰度用）
     score_dual_run: bool = False
     # 退化护栏：批内分数种类过少（模型"偷懒"给同一个分）时重试一次，取更好的结果
-    score_retry_on_degenerate: bool = True
+    score_retry_on_degenerate: bool = False
     # LangGraph checkpointer 的独立 schema，避免污染业务表与 Alembic autogenerate
     langgraph_schema: str = "langgraph"
     # LangSmith 项目名（追踪用，未配置 API Key 时自动不生效）
