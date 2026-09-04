@@ -431,34 +431,354 @@ async def _cmd_market(period: str) -> int:
     return 0
 
 
+def _plotext_bar(
+    labels: list[str],
+    values: list[int],
+    title: str,
+    xlabel: str,
+    width: int = 66,
+    height: int = 10,
+) -> str:
+    """用 plotext 画条形图，返回无色的纯文本字符串（便于嵌入报告）。"""
+    import plotext as plt
+
+    fig = plt.figure
+    fig.clear()
+    fig.plot_size(width, height)
+    fig.draw(fig.bar(labels, values))
+    fig.title(title)
+    if xlabel:
+        fig.label(xlabel, axis="x")
+    fig.label("条数", axis="y")
+    # 保留 plotext 自带的 ANSI 颜色（终端里显示彩色图表）
+    return str(fig.build()).rstrip()
+
+
 async def _cmd_status() -> int:
-    from sqlalchemy import func, select
+    """输出系统状态报告（资讯生命周期 / 事件队列 / 异常检测），用纯文本而非日志。"""
+    from datetime import timedelta
+
+    from sqlalchemy import exists, func, select
 
     from fin_news.core.db import init_db, session_scope
+    from fin_news.core.enums import (
+        AgentType,
+        EventStatus,
+        EventType,
+        NewsStatus,
+        ReportStatus,
+    )
+    from fin_news.core.timeutil import now, to_market_tz
     from fin_news.events.bus import EventBus
-    from fin_news.models.analysis import IngestCursor
-    from fin_news.models.news import NewsItem
+    from fin_news.models.analysis import AnalysisReport, IngestCursor
+    from fin_news.models.event import IngestEvent
+    from fin_news.models.news import NewsChunk, NewsItem
 
-    logger = get_logger(_LOG_NAME)
     await init_db()
+    settings = get_settings()
+    threshold = settings.score_threshold_vectorize
+    SAMPLE = 10
+
     async with session_scope() as session:
-        backlog = await EventBus(session).backlog()
-        total = await session.scalar(select(func.count()).select_from(NewsItem))
-        scored = await session.scalar(
-            select(func.count()).select_from(NewsItem).where(NewsItem.score.is_not(None))
-        )
-        logger.info("统计", backlog=backlog, total=total, scored=scored)
-        rows = (await session.execute(select(IngestCursor))).scalars().all()
-        for c in rows:
-            logger.info(
-                "接入位点",
-                source_key=c.source_key,
-                cursor_time=str(c.cursor_time),
-                last_status=c.last_status,
-                last_count=c.last_count,
-                enabled=c.enabled,
+        async def count_news(*conds) -> int:
+            stmt = select(func.count()).select_from(NewsItem)
+            if conds:
+                stmt = stmt.where(*conds)
+            return int((await session.scalar(stmt)) or 0)
+
+        async def sample_news(conds: list, limit: int = SAMPLE) -> list[tuple[int, int | None, str]]:
+            """取满足条件的资讯样本：(news_id, score, status)。"""
+            rows = await session.execute(
+                select(NewsItem.id, NewsItem.score, NewsItem.status)
+                .where(*conds)
+                .order_by(NewsItem.id)
+                .limit(limit)
             )
-    return 0
+            return [(r[0], r[1], r[2].value) for r in rows.all()]
+
+        # ---------------- 一、资讯总览 ----------------
+        total = await count_news()
+        scored = await count_news(NewsItem.score.is_not(None))
+        unscored = total - scored
+
+        score_rows = (
+            await session.execute(
+                select(NewsItem.score, func.count())
+                .where(NewsItem.score.is_not(None))
+                .group_by(NewsItem.score)
+            )
+        ).all()
+        score_counts = {int(s): int(c) for s, c in score_rows}
+        bands = {
+            "噪声 NOISE": (1, 3, sum(v for k, v in score_counts.items() if 1 <= k <= 3)),
+            "个股 STOCK": (4, 5, sum(v for k, v in score_counts.items() if 4 <= k <= 5)),
+            "行业 INDUSTRY": (6, 7, sum(v for k, v in score_counts.items() if 6 <= k <= 7)),
+            "宏观 MACRO": (8, 10, sum(v for k, v in score_counts.items() if 8 <= k <= 10)),
+        }
+
+        # ---------------- 二、近 5 天资讯条数 ----------------
+        recent_rows = (
+            await session.execute(
+                select(func.date(NewsItem.publish_time), func.count())
+                .where(NewsItem.publish_time >= now() - timedelta(days=5))
+                .group_by(func.date(NewsItem.publish_time))
+            )
+        ).all()
+        recent_map = {d: int(c) for d, c in recent_rows}
+        today = now().date()
+        last5 = [today - timedelta(days=i) for i in range(4, -1, -1)]
+
+        # ---------------- 三、生命周期漏斗 ----------------
+        noise = await count_news(NewsItem.score.is_not(None), NewsItem.score <= threshold)
+        should_embed = scored - noise
+        embedded = await count_news(
+            NewsItem.status.in_([NewsStatus.EMBEDDED, NewsStatus.ANALYZED])
+        )
+        not_embedded = should_embed - embedded
+        analyzed = await count_news(NewsItem.status == NewsStatus.ANALYZED)
+        not_analyzed = embedded - analyzed
+
+        # ---------------- 四、事件队列 ----------------
+        event_rows = (
+            await session.execute(
+                select(IngestEvent.event_type, IngestEvent.status, func.count())
+                .group_by(IngestEvent.event_type, IngestEvent.status)
+            )
+        ).all()
+        events: dict[str, dict[str, int]] = {}
+        for etype, estatus, cnt in event_rows:
+            events.setdefault(etype, {})[estatus.value] = int(cnt)
+        event_order = [
+            EventType.NEWS_INGESTED.value,
+            EventType.NEWS_SCORED.value,
+            EventType.NEWS_EMBEDDED.value,
+            EventType.ANALYSIS_PUBLISHED.value,
+        ]
+        event_order += [e for e in events if e not in event_order]
+        backlog = await EventBus(session).backlog()
+
+        # ---------------- 五、异常检测（含样本） ----------------
+        # 1) 噪声未归档：score <= 阈值却仍未 ARCHIVED_NOISE
+        noise_stuck_conds = [
+            NewsItem.score.is_not(None),
+            NewsItem.score <= threshold,
+            NewsItem.status != NewsStatus.ARCHIVED_NOISE,
+        ]
+        noise_stuck = await count_news(*noise_stuck_conds)
+        noise_stuck_sample = await sample_news(noise_stuck_conds)
+
+        # 2) 应向量化但缺 news.scored 事件（会永远卡住）
+        scored_event_ids = {
+            r[0]
+            for r in (
+                await session.execute(
+                    select(IngestEvent.aggregate_id).where(
+                        IngestEvent.event_type == EventType.NEWS_SCORED.value,
+                        IngestEvent.status.in_(
+                            [EventStatus.PENDING, EventStatus.PROCESSING, EventStatus.DONE]
+                        ),
+                    )
+                )
+            ).all()
+        }
+        pending_embed_ids = [
+            r[0]
+            for r in (
+                await session.execute(
+                    select(NewsItem.id).where(
+                        NewsItem.status.in_([NewsStatus.SCORED, NewsStatus.EMBED_FAILED]),
+                        NewsItem.score.is_not(None),
+                        NewsItem.score > threshold,
+                    )
+                )
+            ).all()
+        ]
+        stuck_ids = [nid for nid in pending_embed_ids if nid not in scored_event_ids]
+        stuck_no_event = len(stuck_ids)
+        stuck_sample = stuck_ids[:SAMPLE]
+
+        # 3) 已向量化但无分块
+        no_chunk_conds = [
+            NewsItem.status == NewsStatus.EMBEDDED,
+            ~exists(select(NewsChunk.news_id).where(NewsChunk.news_id == NewsItem.id)),
+        ]
+        embedded_no_chunks = await count_news(*no_chunk_conds)
+        no_chunk_sample = await sample_news(no_chunk_conds)
+
+        # 4) 已分析但无报告
+        news_agents = [AgentType.MACRO_POLICY, AgentType.INDUSTRY, AgentType.STOCK]
+        no_report_conds = [
+            NewsItem.status == NewsStatus.ANALYZED,
+            ~exists(
+                select(AnalysisReport.id).where(
+                    AnalysisReport.news_id == NewsItem.id,
+                    AnalysisReport.agent_type.in_(news_agents),
+                    AnalysisReport.status.in_([ReportStatus.PUBLISHED, ReportStatus.DEGRADED]),
+                )
+            ),
+        ]
+        analyzed_no_report = await count_news(*no_report_conds)
+        no_report_sample = await sample_news(no_report_conds)
+
+        # 5) 失败状态资讯
+        failed_statuses = [
+            NewsStatus.SCORE_FAILED,
+            NewsStatus.EMBED_FAILED,
+            NewsStatus.ANALYSIS_FAILED,
+            NewsStatus.DEAD,
+        ]
+        failed_info: dict[str, tuple[int, list[tuple[int, int | None, str]]]] = {}
+        for st in failed_statuses:
+            cnt = await count_news(NewsItem.status == st)
+            if cnt:
+                failed_info[st.value] = (cnt, await sample_news([NewsItem.status == st]))
+
+        # 6) 事件失败样本
+        failed_events_sample = (
+            await session.execute(
+                select(IngestEvent.event_type, IngestEvent.aggregate_id)
+                .where(IngestEvent.status == EventStatus.FAILED)
+                .order_by(IngestEvent.id)
+                .limit(SAMPLE)
+            )
+        ).all()
+        failed_events = sum(st.get("FAILED", 0) for st in events.values())
+
+        # 7) 接入位点
+        cursors = list((await session.execute(select(IngestCursor))).scalars().all())
+
+    # ---------------- 渲染 ----------------
+    def ids_line(ids: list[int]) -> str:
+        shown = ", ".join(str(i) for i in ids)
+        return f"示例 news_id：{shown}" + ("…" if len(ids) >= SAMPLE else "")
+
+    W = 28
+    out: list[str] = []
+    out.append("=" * 72)
+    out.append("  fin-news 系统状态报告")
+    out.append(f"  生成时间：{now().strftime('%Y-%m-%d %H:%M:%S')}    阈值：评分>{threshold} 才向量化/分析")
+    out.append("=" * 72)
+
+    # 一、资讯总览
+    out.append("")
+    out.append("【一、资讯总览】")
+    out.append(f"  {'资讯总数':<{W - 2}}{total}")
+    out.append(f"  {'├─ 未评分':<{W - 2}}{unscored}")
+    out.append(f"  {'└─ 已评分':<{W - 2}}{scored}")
+    out.append("")
+    out.append(
+        _plotext_bar(
+            [str(k) for k in range(1, 11)],
+            [score_counts.get(k, 0) for k in range(1, 11)],
+            title="分值分布（1~10 分）",
+            xlabel="评分",
+        )
+    )
+    out.append("")
+    out.append("  按分档汇总：")
+    for name, (lo, hi, cnt) in bands.items():
+        out.append(f"    {name:<14}({lo:>2}~{hi:>2} 分)  {cnt:>6} 条")
+
+    # 二、近 5 天资讯条数
+    out.append("")
+    out.append("【二、近 5 天资讯条数】")
+    out.append(
+        _plotext_bar(
+            [d.strftime("%m-%d") for d in last5],
+            [recent_map.get(d, 0) for d in last5],
+            title="近 5 天资讯条数",
+            xlabel="日期",
+            height=8,
+        )
+    )
+
+    # 三、生命周期漏斗
+    out.append("")
+    out.append("【三、处理链路漏斗】")
+    noise_label = f"├─ 噪声（≤{threshold}分，无需向量化）"
+    embed_label = f"└─ 应向量化（>{threshold}分）"
+    out.append(f"  {'资讯总数':<{W - 2}}{total}")
+    out.append(f"  {'├─ 已评分':<{W - 2}}{scored}")
+    out.append(f"  {'│  ' + noise_label:<{W - 2}}{noise}")
+    out.append(f"  {'│  ' + embed_label:<{W - 2}}{should_embed}")
+    out.append(f"  {'│     ├─ 已向量化':<{W - 2}}{embedded}")
+    out.append(f"  {'│     │  ├─ 已分析':<{W - 2}}{analyzed}")
+    out.append(f"  {'│     │  └─ 未分析':<{W - 2}}{not_analyzed}")
+    out.append(f"  {'│     └─ 未向量化':<{W - 2}}{not_embedded}")
+    out.append(f"  {'└─ 未评分':<{W - 2}}{unscored}")
+
+    # 四、事件队列
+    out.append("")
+    out.append("【四、事件队列】")
+    header = f"  {'类型':<20}{'PENDING':>9}{'PROC':>7}{'DONE':>8}{'FAILED':>8}{'合计':>8}"
+    out.append(header)
+    out.append("  " + "-" * (len(header) - 2))
+    for etype in event_order:
+        st = events.get(etype, {})
+        pend = st.get("PENDING", 0)
+        proc = st.get("PROCESSING", 0)
+        done = st.get("DONE", 0)
+        failed = st.get("FAILED", 0)
+        out.append(
+            f"  {etype:<20}{pend:>9}{proc:>7}{done:>8}{failed:>8}{pend + proc + done + failed:>8}"
+        )
+    out.append(f"  积压 pending={backlog['pending']}  overdue={backlog['overdue']}  dead_letter={backlog['dead_letter']}")
+
+    # 五、异常检测
+    out.append("")
+    out.append("【五、异常检测】")
+    anomalies: list[str] = []
+    anomaly_details: list[str] = []
+    if noise_stuck:
+        anomalies.append(f"噪声未归档（≤{threshold}分仍非 ARCHIVED_NOISE）：{noise_stuck} 条")
+        anomaly_details.append(
+            "    " + ids_line([r[0] for r in noise_stuck_sample])
+            + "（评分≤" + str(threshold) + "）"
+        )
+    if stuck_no_event:
+        anomalies.append(f"应向量化但缺 news.scored 事件（会卡住）：{stuck_no_event} 条")
+        anomaly_details.append("    " + ids_line(stuck_sample))
+    if embedded_no_chunks:
+        anomalies.append(f"已向量化但无分块：{embedded_no_chunks} 条")
+        anomaly_details.append("    " + ids_line([r[0] for r in no_chunk_sample]))
+    if analyzed_no_report:
+        anomalies.append(f"已分析但无报告：{analyzed_no_report} 条")
+        anomaly_details.append("    " + ids_line([r[0] for r in no_report_sample]))
+    for st, (cnt, sample) in failed_info.items():
+        anomalies.append(f"资讯失败状态 {st}：{cnt} 条")
+        anomaly_details.append("    " + ids_line([r[0] for r in sample]))
+    if failed_events:
+        anomalies.append(f"事件失败（FAILED）：{failed_events} 条")
+        ev_sample = ", ".join(f"{t}:{a}" for t, a in failed_events_sample)
+        anomaly_details.append(f"    示例 (event_type:aggregate_id)：{ev_sample}")
+    if backlog["overdue"]:
+        anomalies.append(f"事件积压 overdue：{backlog['overdue']} 条")
+    if backlog["dead_letter"]:
+        anomalies.append(f"死信 dead_letter：{backlog['dead_letter']} 条")
+
+    if anomalies:
+        for a in anomalies:
+            out.append(f"  [异常] {a}")
+        out.append("  详情：")
+        out.extend(anomaly_details)
+    else:
+        out.append("  [OK] 未发现明显异常，链路已闭环")
+
+    # 六、接入位点
+    out.append("")
+    out.append("【六、接入位点】")
+    for c in cursors:
+        # cursor_time 是 timestamptz，asyncpg 读回为 UTC，需显式转到业务时区展示
+        cursor_time = to_market_tz(c.cursor_time).strftime("%Y-%m-%d %H:%M:%S")
+        out.append(
+            f"    {c.source_key:<24} 位点={cursor_time}  "
+            f"状态={c.last_status or '-'} 条数={c.last_count or 0} 启用={c.enabled}"
+        )
+
+    out.append("")
+    out.append("=" * 72)
+    print("\n".join(out))
+    return 1 if anomalies else 0
 
 
 async def _cmd_selftest() -> int:
