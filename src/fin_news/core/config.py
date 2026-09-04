@@ -123,6 +123,11 @@ class Settings(BaseSettings):
     embedding_batch_size: int = 32
     # embedding HTTP 请求的进程级并发上限（火山 multimodal 单样本语义只能逐条请求，靠并发提吞吐）
     embedding_concurrency: int = 16
+    # 429 / 5xx 的退避重试次数（多模态接口限流时避免整批失败）
+    embedding_max_retries: int = 3
+    # 进程级 QPS 上限（令牌桶）：并发闸门只能控「同时 in-flight 数」，控不住每秒请求数。
+    # 0 表示不启用，仅用 embedding_concurrency 控并发。
+    embedding_qps: float = 0
 
     # ---------------- LLM ----------------
     llm_default_provider: ProviderName = "volcengine"

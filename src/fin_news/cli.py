@@ -151,14 +151,14 @@ def _install_stop_handler(worker: PipelineWorker) -> None:
             logger.debug("当前平台不支持信号回调，忽略优雅退出", signal=sig.name)
 
 
-async def _cmd_score() -> int:
+async def _cmd_score(limit: int | None = None) -> int:
     from fin_news.agents.scoring_agent import ScoringAgent
     from fin_news.core.db import init_db, session_scope
 
     logger = get_logger(_LOG_NAME)
     await init_db()
     async with session_scope() as session:
-        n = await ScoringAgent().score_pending(session)
+        n = await ScoringAgent().score_pending(session, limit=limit)
         logger.info("已评分", count=n)
     return 0
 
@@ -190,6 +190,19 @@ async def _cmd_embed(limit: int | None = None) -> int:
     if not settings.has_llm_credentials():
         logger.warning("未配置模型 API Key，无法向量化")
         return 1
+
+    # 执行前先把本次向量化的关键配置打到日志，便于排查限流 / 维度 / 并发问题
+    logger.info(
+        "向量化配置",
+        provider=settings.embedding_provider,
+        model=settings.model_for(settings.embedding_provider, "embedding"),
+        embedding_dim=settings.embedding_dim,
+        embedding_concurrency=settings.embedding_concurrency,
+        embedding_max_retries=settings.embedding_max_retries,
+        embedding_qps=settings.embedding_qps,
+        llm_timeout_seconds=settings.llm_timeout_seconds,
+        score_threshold_vectorize=settings.score_threshold_vectorize,
+    )
 
     await init_db()
     batch = limit or settings.scoring_batch_size * 10
@@ -758,7 +771,7 @@ async def _dispatch(args: argparse.Namespace) -> int:
     if args.command == "worker":
         return await _cmd_pipeline(once=False)
     if args.command == "score":
-        return await _cmd_score()
+        return await _cmd_score(limit=getattr(args, "limit", None))
     if args.command == "embed":
         return await _cmd_embed(limit=getattr(args, "limit", None))
     if args.command == "sweep":
@@ -794,7 +807,7 @@ def main() -> None:
         ],
     )
     parser.add_argument(
-        "--limit", type=int, default=None, help="embed：本轮最多处理的资讯条数"
+        "--limit", type=int, default=None, help="score/embed：本轮最多处理的资讯条数（默认取配置值）"
     )
     parser.add_argument(
         "--apply", action="store_true", help="sweep：实际执行修正（默认只扫描不修改）"

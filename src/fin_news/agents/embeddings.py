@@ -26,6 +26,7 @@ doubao-embedding-vision 与旧文本模型（doubao-embedding-text-240715）的�
 from __future__ import annotations
 
 import asyncio
+import random
 import time
 import uuid
 from typing import Any
@@ -48,11 +49,40 @@ class DimensionMismatch(ValueError):
     """向量维度与配置不一致（禁止写入，避免污染索引）。"""
 
 
+class _TokenBucket:
+    """进程级 QPS 令牌桶：限制每秒请求数，弥补并发闸门不控 QPS 的缺口。
+
+    并发上限只能约束「同一时刻有多少请求在飞」，无法约束「每秒发出多少请求」；
+    当每个请求耗时很短时，低并发也可能产生很高的 QPS 打满模型配额。
+    """
+
+    def __init__(self, qps: float) -> None:
+        self.qps = max(0.0, float(qps))
+        self._tokens = self.qps
+        self._updated = time.monotonic()
+        self._lock = asyncio.Lock()
+
+    async def acquire(self) -> None:
+        while True:
+            async with self._lock:
+                now = time.monotonic()
+                self._tokens = min(self.qps, self._tokens + (now - self._updated) * self.qps)
+                self._updated = now
+                if self._tokens >= 1.0:
+                    self._tokens -= 1.0
+                    return
+                wait = (1.0 - self._tokens) / self.qps
+            await asyncio.sleep(wait)
+
+
 class Embedder:
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or get_settings()
         self._client: httpx.AsyncClient | None = None
         self._semaphore: asyncio.Semaphore | None = None
+        self._rate_limiter: _TokenBucket | None = (
+            _TokenBucket(self.settings.embedding_qps) if self.settings.embedding_qps > 0 else None
+        )
         # 进程内攒批的审计日志；由 flush_logs() 一次批量落库
         self._pending_logs: list[LLMCallLog] = []
         self._flush_lock = asyncio.Lock()
@@ -138,34 +168,71 @@ class Embedder:
                 await self.flush_logs()
 
     async def _embed_one(self, text: str) -> list[float]:
-        """单条 embedding 请求（受进程级闸门限流）。"""
+        """单条 embedding 请求（受并发闸门 + 可选 QPS 令牌桶限流）。"""
         async with self._sem:
+            if self._rate_limiter is not None:
+                await self._rate_limiter.acquire()
             return await self._request(text)
 
     async def _request(self, text: str) -> list[float]:
         url, headers = self._endpoint()
         model = self.settings.model_for(self.settings.embedding_provider, "embedding")
         started = time.perf_counter()
-        try:
-            resp = await self.client.post(url, json=self._payload(text), headers=headers)
-            resp.raise_for_status()
-            data = resp.json()
-            vec = self._parse_response(data)
-        except Exception as exc:  # noqa: BLE001
+        max_retries = max(0, int(self.settings.embedding_max_retries))
+        last_error: Exception | None = None
+
+        for attempt in range(max_retries + 1):
+            try:
+                resp = await self.client.post(url, json=self._payload(text), headers=headers)
+                resp.raise_for_status()
+                data = resp.json()
+                vec = self._parse_response(data)
+            except httpx.HTTPStatusError as exc:
+                last_error = exc
+                status = exc.response.status_code
+                # 429 与 5xx 是瞬时/服务端问题，退避后重试；4xx 其它错误不重试
+                if (status == 429 or status >= 500) and attempt < max_retries:
+                    delay = self._retry_delay(exc.response, attempt)
+                    logger.warning(
+                        "embedding 限流/服务端错误，退避重试",
+                        attempt=attempt + 1,
+                        status=status,
+                        delay_ms=int(delay * 1000),
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                break
+            except Exception as exc:  # noqa: BLE001 - 网络/解析错误不重试，统一收口
+                last_error = exc
+                break
+
+            usage = data.get("usage") or {}
+            prompt_tokens = int(usage.get("input_tokens") or usage.get("total_tokens") or 0)
             latency_ms = int((time.perf_counter() - started) * 1000)
             self._log_call(
-                model=model, prompt_tokens=0, latency_ms=latency_ms,
-                status="ERROR", error=str(exc)[:500],
+                model=model, prompt_tokens=prompt_tokens, latency_ms=latency_ms, status="OK"
             )
-            raise
+            return vec
 
-        usage = data.get("usage") or {}
-        prompt_tokens = int(usage.get("input_tokens") or usage.get("total_tokens") or 0)
+        # 重试耗尽或不可重试错误：记录一次失败日志后抛出
         latency_ms = int((time.perf_counter() - started) * 1000)
         self._log_call(
-            model=model, prompt_tokens=prompt_tokens, latency_ms=latency_ms, status="OK"
+            model=model, prompt_tokens=0, latency_ms=latency_ms,
+            status="ERROR", error=str(last_error)[:500],
         )
-        return vec
+        assert last_error is not None  # 循环内所有退出路径都已赋值
+        raise last_error
+
+    @staticmethod
+    def _retry_delay(resp: httpx.Response, attempt: int) -> float:
+        """优先取 Retry-After 头，否则指数退避（1s/2s/4s…封顶 30s），加抖动避免惊群。"""
+        retry_after = resp.headers.get("Retry-After")
+        if retry_after:
+            try:
+                return min(float(retry_after), 60.0)
+            except ValueError:
+                pass
+        return min(2 ** attempt, 30) + random.uniform(0, 1)
 
     def _log_call(
         self,
