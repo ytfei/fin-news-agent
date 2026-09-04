@@ -472,8 +472,10 @@ async def _cmd_status() -> int:
         AgentType,
         EventStatus,
         EventType,
+        IngestKind,
         NewsStatus,
         ReportStatus,
+        ScoreBand,
     )
     from fin_news.core.timeutil import now, to_market_tz
     from fin_news.events.bus import EventBus
@@ -651,13 +653,68 @@ async def _cmd_status() -> int:
         ).all()
         failed_events = sum(st.get("FAILED", 0) for st in events.values())
 
-        # 7) 接入位点
+        # 7) 渠道分布（按 src_name 聚合：总数 / 分值档 / 类型）
+        channel_expr = func.coalesce(NewsItem.src_name, NewsItem.source)
+        band_rows = (
+            await session.execute(
+                select(
+                    channel_expr,
+                    func.count(),
+                    func.count().filter(NewsItem.score.is_(None)),
+                    func.count().filter(NewsItem.band == ScoreBand.NOISE),
+                    func.count().filter(NewsItem.band == ScoreBand.STOCK),
+                    func.count().filter(NewsItem.band == ScoreBand.INDUSTRY),
+                    func.count().filter(NewsItem.band == ScoreBand.MACRO),
+                )
+                .group_by(channel_expr)
+                .order_by(func.count().desc())
+            )
+        ).all()
+        channel_bands: dict[str, dict[str, int]] = {}
+        for r in band_rows:
+            channel_bands[r[0]] = {
+                "total": int(r[1]),
+                "unscored": int(r[2]),
+                "noise": int(r[3]),
+                "stock": int(r[4]),
+                "industry": int(r[5]),
+                "macro": int(r[6]),
+            }
+        channel_order = [r[0] for r in band_rows]
+
+        kind_rows = (
+            await session.execute(
+                select(channel_expr, NewsItem.kind, func.count()).group_by(
+                    channel_expr, NewsItem.kind
+                )
+            )
+        ).all()
+        channel_kinds: dict[str, dict[str, int]] = {}
+        present_kinds: set[str] = set()
+        for channel, kind, cnt in kind_rows:
+            channel_kinds.setdefault(channel, {})[kind.value] = int(cnt)
+            present_kinds.add(kind.value)
+        kind_order = [k.value for k in IngestKind if k.value in present_kinds]
+
+        # 8) 接入位点
         cursors = list((await session.execute(select(IngestCursor))).scalars().all())
 
     # ---------------- 渲染 ----------------
     def ids_line(ids: list[int]) -> str:
         shown = ", ".join(str(i) for i in ids)
         return f"示例 news_id：{shown}" + ("…" if len(ids) >= SAMPLE else "")
+
+    def _w(s) -> int:
+        """终端显示宽度（中文按 2 列算）。"""
+        return sum(2 if ord(c) > 0x7F else 1 for c in str(s))
+
+    def _l(s, width: int) -> str:
+        s = str(s)
+        return s + " " * max(0, width - _w(s))
+
+    def _r(s, width: int) -> str:
+        s = str(s)
+        return " " * max(0, width - _w(s)) + s
 
     W = 28
     out: list[str] = []
@@ -699,9 +756,33 @@ async def _cmd_status() -> int:
         )
     )
 
-    # 三、生命周期漏斗
+    # 三、渠道分布
     out.append("")
-    out.append("【三、处理链路漏斗】")
+    out.append("【三、渠道分布】")
+    band_keys = ["unscored", "noise", "stock", "industry", "macro"]
+    headers = ["渠道", "总数", "未评分", "噪声", "个股", "行业", "宏观"] + kind_order
+    rows: list[list[str]] = []
+    for name in channel_order:
+        b = channel_bands[name]
+        row = [name, str(b["total"])] + [str(b[k]) for k in band_keys]
+        row += [str(channel_kinds.get(name, {}).get(k, 0)) for k in kind_order]
+        rows.append(row)
+    rows.append(
+        ["合计", str(total)]
+        + [str(sum(channel_bands[n][k] for n in channel_order)) for k in band_keys]
+        + [str(sum(channel_kinds.get(n, {}).get(k, 0) for n in channel_order)) for k in kind_order]
+    )
+    widths = [
+        max(_w(h), max(_w(r[i]) for r in rows)) + 2 for i, h in enumerate(headers)
+    ]
+    out.append("  " + _l(headers[0], widths[0]) + "".join(_r(h, widths[i]) for i, h in enumerate(headers[1:], 1)))
+    out.append("  " + "-" * sum(widths))
+    for r in rows:
+        out.append("  " + _l(r[0], widths[0]) + "".join(_r(r[i], widths[i]) for i in range(1, len(r))))
+
+    # 四、生命周期漏斗
+    out.append("")
+    out.append("【四、处理链路漏斗】")
     noise_label = f"├─ 噪声（≤{threshold}分，无需向量化）"
     embed_label = f"└─ 应向量化（>{threshold}分）"
     out.append(f"  {'资讯总数':<{W - 2}}{total}")
@@ -714,9 +795,9 @@ async def _cmd_status() -> int:
     out.append(f"  {'│     └─ 未向量化':<{W - 2}}{not_embedded}")
     out.append(f"  {'└─ 未评分':<{W - 2}}{unscored}")
 
-    # 四、事件队列
+    # 五、事件队列
     out.append("")
-    out.append("【四、事件队列】")
+    out.append("【五、事件队列】")
     header = f"  {'类型':<20}{'PENDING':>9}{'PROC':>7}{'DONE':>8}{'FAILED':>8}{'合计':>8}"
     out.append(header)
     out.append("  " + "-" * (len(header) - 2))
@@ -731,9 +812,9 @@ async def _cmd_status() -> int:
         )
     out.append(f"  积压 pending={backlog['pending']}  overdue={backlog['overdue']}  dead_letter={backlog['dead_letter']}")
 
-    # 五、异常检测
+    # 六、异常检测
     out.append("")
-    out.append("【五、异常检测】")
+    out.append("【六、异常检测】")
     anomalies: list[str] = []
     anomaly_details: list[str] = []
     if noise_stuck:
@@ -771,9 +852,9 @@ async def _cmd_status() -> int:
     else:
         out.append("  [OK] 未发现明显异常，链路已闭环")
 
-    # 六、接入位点
+    # 七、接入位点
     out.append("")
-    out.append("【六、接入位点】")
+    out.append("【七、接入位点】")
     for c in cursors:
         # cursor_time 是 timestamptz，asyncpg 读回为 UTC，需显式转到业务时区展示
         cursor_time = to_market_tz(c.cursor_time).strftime("%Y-%m-%d %H:%M:%S")
