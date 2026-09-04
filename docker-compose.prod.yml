@@ -1,8 +1,8 @@
 # 生产编排：与 docker-compose.dev.yml 的唯一区别是 app / web 不再本地构建，
 # 而是拉取 ghcr.io 上已发布的镜像。
 #
-# 镜像由 .github/workflows/docker-release.yml 在推送 v* tag 时构建并推送，
-# 该工作流会自动把下面的 tag 改写为新版本号后提交回 main。
+# 镜像由 .github/workflows/docker-release.yml 在推送 v* tag 时构建并推送。
+# 下面的版本号由 scripts/release.sh（git release）在发版时自动同步并提交，
 # 不要手工改这里的 tag；需要回滚时用 git revert 对应的 chore(release) 提交。
 #
 # 部署：

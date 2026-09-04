@@ -1,10 +1,11 @@
 name: Release 镜像
 
-# 推送 v* tag 时构建正式版本镜像，并把 docker-compose.prod.yml 的镜像引用
-# 更新到该版本后提交回 main，使生产环境 `docker compose pull && up -d` 直接生效。
+# 推送 v* tag 时构建正式版本镜像并推送到 ghcr.io。
+# docker-compose.prod.yml 的镜像版本号由 scripts/release.sh（git release）在发版时同步，
+# 不再由 CI 回写（避免机器人提交污染历史）。
 #
 # 用法：
-#   git tag v1.2.3 && git push origin v1.2.3
+#   git release v1.2.3
 on:
   push:
     tags: ["v*"]
@@ -76,45 +77,3 @@ jobs:
           platforms: linux/amd64
           cache-from: type=gha,scope=release-${{ matrix.name }}
           cache-to: type=gha,mode=max,scope=release-${{ matrix.name }}
-
-  # 镜像全部推送成功后才回写 compose，避免出现「compose 已指向新版本但镜像还没推完」
-  update-compose:
-    needs: build
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-
-    steps:
-      - name: 检出 main
-        uses: actions/checkout@v4
-        with:
-          # tag 推送时默认检出的是 tag（游离 HEAD），这里显式切到 main 才能提交回写
-          ref: main
-          fetch-depth: 0
-
-      - name: 更新 compose 镜像引用到 ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-          # 用 BRE（不带 -E）+ \(...\) 分组：GNU sed 与 BSD/macOS sed 都支持，
-          # 避免 ERE 下 \1 反引用在 BSD sed 上不可用的坑
-          sed -i "s#\(ghcr\.io/[^/[:space:]]*/fin-news-agent-app\):[^[:space:]\"']*#\1:${{ github.ref_name }}#g" docker-compose.prod.yml
-          sed -i "s#\(ghcr\.io/[^/[:space:]]*/fin-news-agent-web\):[^[:space:]\"']*#\1:${{ github.ref_name }}#g" docker-compose.prod.yml
-          echo "--- 更新后的镜像引用 ---"
-          grep -n "image:" docker-compose.prod.yml
-
-      - name: 校验 compose 仍可解析
-        run: docker compose -f docker-compose.prod.yml config > /dev/null
-
-      - name: 提交回 main
-        run: |
-          set -euo pipefail
-          if git diff --quiet; then
-            echo "compose 镜像引用无变化，跳过提交"
-            exit 0
-          fi
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add docker-compose.prod.yml
-          # [skip ci] 阻止这次提交再次触发 docker-dev.yml，否则会无限触发构建
-          git commit -m "chore(release): 生产镜像引用更新至 ${{ github.ref_name }} [skip ci]"
-          git push origin main
