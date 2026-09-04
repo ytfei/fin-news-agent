@@ -35,6 +35,15 @@ class NewsStatus(StrEnum):
         return self in (NewsStatus.ANALYZED, NewsStatus.ARCHIVED_NOISE, NewsStatus.DEAD)
 
 
+class ArticleStatus(StrEnum):
+    """微信公众号文章状态（「草稿/发布」由用户手动设置）。"""
+
+    NEW = "NEW"  # 新建
+    DRAFT = "DRAFT"  # 草稿（已推送到微信公众号草稿箱）
+    PUBLISHED = "PUBLISHED"  # 已发布
+    DELETED = "DELETED"  # 已删除
+
+
 class AgentType(StrEnum):
     SCORING = "scoring"
     MACRO_POLICY = "macro_policy"
@@ -42,6 +51,7 @@ class AgentType(StrEnum):
     STOCK = "stock"
     PRE_MARKET = "pre_market"
     POST_MARKET = "post_market"
+    WECHAT_ARTICLE = "wechat_article"
     QA = "qa"
 
 

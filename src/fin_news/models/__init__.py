@@ -26,6 +26,7 @@ from fin_news.models.event import (
     PromptTemplate,
 )
 from fin_news.models.news import NewsChunk, NewsEntity, NewsItem, NewsScore
+from fin_news.models.wechat import WechatArticle, WechatArticleChunk
 
 __all__ = [
     "Base",
@@ -33,6 +34,8 @@ __all__ = [
     "NewsScore",
     "NewsChunk",
     "NewsEntity",
+    "WechatArticle",
+    "WechatArticleChunk",
     "IngestEvent",
     "AgentRun",
     "LLMCallLog",

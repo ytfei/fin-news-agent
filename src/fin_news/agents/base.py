@@ -118,6 +118,8 @@ async def _run_plain_agent(
     system_prompt: str,
     user_prompt: str,
     settings: Settings,
+    *,
+    response_schema: dict[str, Any] = ANALYSIS_SCHEMA,
 ) -> AgentOutput:
     """降级路径：直接一次结构化调用（工具结果已在 user_prompt 中内联）。"""
     client = get_llm_client(settings)
@@ -125,7 +127,7 @@ async def _run_plain_agent(
         role="analysis",
         system=system_prompt,
         user=user_prompt,
-        response_schema=ANALYSIS_SCHEMA,
+        response_schema=response_schema,
         temperature=0.2,
     )
     data = resp.data if isinstance(resp.data, dict) else {}

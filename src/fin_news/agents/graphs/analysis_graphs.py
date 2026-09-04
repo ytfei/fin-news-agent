@@ -31,8 +31,13 @@ from fin_news.agents.prompts import (
     PRE_MARKET_VERSION,
     STOCK_SYSTEM,
     STOCK_VERSION,
+    WECHAT_SYSTEM,
+    WECHAT_VERSION,
 )
-from fin_news.agents.schemas import AnalysisPayload
+from fin_news.agents.schemas import AnalysisPayload, ArticlePayload
+from fin_news.agents.tools.langchain_tools import (
+    article_search as article_search_tool,
+)
 from fin_news.agents.tools.langchain_tools import (
     history_search as history_search_tool,
 )
@@ -56,7 +61,7 @@ logger = get_logger("agents.graphs.analysis")
 class AnalysisRun:
     """一次分析图的执行结果。payload=None 表示结构化输出失败（调用方负责降级）。"""
 
-    payload: AnalysisPayload | None = None
+    payload: Any | None = None
     model: str = ""
     prompt_tokens: int = 0
     completion_tokens: int = 0
@@ -73,6 +78,18 @@ AGENT_GRAPH_CONFIG: dict[AgentType, tuple[str, str]] = {
     # 输出同样收敛到 AnalysisPayload（verdict/attribution 等走 extras）
     AgentType.PRE_MARKET: (PRE_MARKET_SYSTEM, PRE_MARKET_VERSION),
     AgentType.POST_MARKET: (POST_MARKET_SYSTEM, POST_MARKET_VERSION),
+    # 公众号文章：输出收敛到 ArticlePayload（title/summary/content 等）
+    AgentType.WECHAT_ARTICLE: (WECHAT_SYSTEM, WECHAT_VERSION),
+}
+
+# 每个 Agent 的结构化输出模型（用于 response_format 与结果校验）
+RESPONSE_MODELS: dict[AgentType, type] = {
+    AgentType.MACRO_POLICY: AnalysisPayload,
+    AgentType.INDUSTRY: AnalysisPayload,
+    AgentType.STOCK: AnalysisPayload,
+    AgentType.PRE_MARKET: AnalysisPayload,
+    AgentType.POST_MARKET: AnalysisPayload,
+    AgentType.WECHAT_ARTICLE: ArticlePayload,
 }
 
 
@@ -229,8 +246,8 @@ def _subagents_for(agent_type: AgentType, settings: Settings) -> list[SubAgent] 
 # ----------------------------------------------------------------------
 
 
-def _response_format_for(settings: Settings) -> Any:
-    """按 provider 选择结构化输出策略。
+def _response_format_for(agent_type: AgentType, settings: Settings) -> Any:
+    """按 provider 选择结构化输出策略，并按 agent 选择输出模型。
 
     实测（2026-09-01）：
     * 火山引擎：json_schema（ProviderStrategy）可用，且质量优于 function_calling
@@ -239,19 +256,31 @@ def _response_format_for(settings: Settings) -> Any:
     """
     from langchain.agents.structured_output import ProviderStrategy, ToolStrategy
 
+    response_model = RESPONSE_MODELS.get(agent_type, AnalysisPayload)
     if settings.llm_default_provider == "deepseek":
-        return ToolStrategy(AnalysisPayload)
-    return ProviderStrategy(AnalysisPayload)
+        return ToolStrategy(response_model)
+    return ProviderStrategy(response_model)
 
 
 def build_analysis_graph(
-    agent_type: AgentType, settings: Settings | None = None, *, response_format: Any = None
+    agent_type: AgentType,
+    settings: Settings | None = None,
+    *,
+    response_format: Any = None,
+    system_prompt: str | None = None,
+    extra_tools: list[Any] | None = None,
 ):
-    """构建 DeepAgents 图。response_format 可注入（测试用），默认按 provider 选择。"""
+    """构建 DeepAgents 图。
+
+    - response_format：可注入（测试用），默认按 provider + agent 选择。
+    - system_prompt / extra_tools：供「skills」注入用 —— 公众号文章 Agent 会动态
+      追加提示词型技能的正文，并挂入工具型技能。
+    """
     from deepagents import create_deep_agent
 
     settings = settings or get_settings()
-    system_prompt, _version = AGENT_GRAPH_CONFIG[agent_type]
+    base_system_prompt, _version = AGENT_GRAPH_CONFIG[agent_type]
+    system_prompt = system_prompt or base_system_prompt
 
     # 注意：必须用 with_fallback=False（纯 ChatOpenAI）。deepagents 的 resolve_model
     # 只认识 BaseChatModel / str，`with_fallbacks()` 返回的 RunnableWithFallbacks 会被
@@ -259,9 +288,11 @@ def build_analysis_graph(
     # analysis_agents._run_analysis 在「整图失败」时降级到 legacy 单次调用（带主备降级）。
     model = get_model_factory(settings).chat("analysis", with_fallback=False)
     tools = _main_tools(agent_type, settings)
+    if extra_tools:
+        tools = tools + list(extra_tools)
     subagents = _subagents_for(agent_type, settings)
 
-    rf = response_format if response_format is not None else _response_format_for(settings)
+    rf = response_format if response_format is not None else _response_format_for(agent_type, settings)
     return create_deep_agent(
         model=model,
         tools=tools,
@@ -292,6 +323,14 @@ MAIN_TOOLS: dict[AgentType, tuple[Any, ...]] = {
     ),
     # 盘后：机构解读与次日预期
     AgentType.POST_MARKET: (
+        history_search_tool,
+        web_search_tool,
+        stock_lookup_tool,
+        market_snapshot_tool,
+    ),
+    # 公众号文章：历史文章回顾（记忆）+ 资讯检索 + 盘面/个股 + 可选联网补充
+    AgentType.WECHAT_ARTICLE: (
+        article_search_tool,
         history_search_tool,
         web_search_tool,
         stock_lookup_tool,
@@ -433,11 +472,12 @@ async def run_analysis(
             error=f"{type(exc).__name__}: {str(exc)[:300]}",
         )
 
+    response_model = RESPONSE_MODELS.get(agent_type, AnalysisPayload)
     payload = result.get("structured_response")
-    if payload is not None and not isinstance(payload, AnalysisPayload):
+    if payload is not None and not isinstance(payload, response_model):
         # 极端情况下可能拿到 dict / 其他类型，做一次归一化
         try:
-            payload = AnalysisPayload.model_validate(payload)
+            payload = response_model.model_validate(payload)
         except Exception:  # noqa: BLE001
             payload = None
 

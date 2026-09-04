@@ -178,6 +178,11 @@ class Settings(BaseSettings):
     # LangSmith 项目名（追踪用，未配置 API Key 时自动不生效）
     langchain_project: str = "fin-news-v5"
 
+    # ---------------- Skills / 微信公众号 ----------------
+    # 写文章 Agent 的 skills 目录（提示词型 SKILL.md + 工具型 tool.py），
+    # 相对路径按进程工作目录解析；CLI `article write --skills-dir` 可覆盖。
+    skills_dir: str = "skills"
+
     # ---------------- 外部检索（Tavily） ----------------
     # 见 https://docs.tavily.com/sdk/python/reference
     web_search_enabled: bool = False

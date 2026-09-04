@@ -14,6 +14,13 @@
     uv run python -m fin_news.cli status           # 查看积压与统计
     uv run python -m fin_news.cli selftest         # 数据源 / LLM / Embedding 连通性自检
 
+    # 微信公众号文章
+    uv run python -m fin_news.cli article list                  # 列出文章
+    uv run python -m fin_news.cli article write                 # 写当日文章
+    uv run python -m fin_news.cli article write --date 2026-09-04 --skills-dir skills
+    uv run python -m fin_news.cli article status 5 PUBLISHED    # 修改文章状态
+    uv run python -m fin_news.cli article show 5                # 查看文章内容
+
 日志级别：默认 INFO；`-v` 升到 DEBUG（看业务 debug 日志）；`-vv` 再把
 第三方库（httpx/openai/sqlalchemy 等）的日志也放开到 DEBUG。
 
@@ -1082,6 +1089,133 @@ async def _check_vector_column(vec: list[float]) -> bool:  # noqa: C901
     return ok
 
 
+# ----------------------------------------------------------------------
+# 微信公众号文章 CLI
+# ----------------------------------------------------------------------
+
+
+async def _cmd_article(args: argparse.Namespace) -> int:
+    action = getattr(args, "article_action", "list")
+    if action == "list":
+        return await _article_list()
+    if action == "write":
+        return await _article_write(
+            date_str=getattr(args, "date", None),
+            skills_dir=getattr(args, "skills_dir", None),
+        )
+    if action == "status":
+        return await _article_set_status(args.article_id, args.new_status)
+    if action == "show":
+        return await _article_show(args.article_id)
+    get_logger(_LOG_NAME).warning("未知 article 子命令", action=action)
+    return 1
+
+
+async def _article_list() -> int:
+    from sqlalchemy import select
+
+    from fin_news.core.db import init_db, session_scope
+    from fin_news.models.wechat import WechatArticle
+
+    await init_db()
+    async with session_scope() as session:
+        rows = (
+            await session.execute(
+                select(WechatArticle).order_by(
+                    WechatArticle.publish_date.desc(), WechatArticle.id.desc()
+                )
+            )
+        ).scalars().all()
+
+    if not rows:
+        print("暂无公众号文章")
+        return 0
+    print(f"{'ID':<6}{'日期':<12}{'状态':<10}标题")
+    print("-" * 72)
+    for a in rows:
+        print(f"{a.id:<6}{str(a.publish_date):<12}{a.status.value:<10}{a.title[:44]}")
+    return 0
+
+
+async def _article_write(date_str: str | None, skills_dir: str | None) -> int:
+    from datetime import date
+
+    from fin_news.agents.wechat_agent import write_article
+    from fin_news.core.db import init_db, session_scope
+    from fin_news.core.timeutil import market_today
+
+    await init_db()
+    try:
+        publish_date = date.fromisoformat(date_str) if date_str else market_today()
+    except ValueError:
+        print(f"日期格式错误：{date_str!r}，请用 YYYY-MM-DD")
+        return 1
+
+    async with session_scope() as session:
+        article = await write_article(session, publish_date, skills_dir=skills_dir)
+    if article is None:
+        print(f"{publish_date} 无可用资讯，未生成文章")
+        return 1
+    print(f"已生成文章 #{article.id}《{article.title}》（状态 NEW）")
+    return 0
+
+
+async def _article_set_status(article_id: str, new_status: str) -> int:
+    from fin_news.core.db import init_db, session_scope
+    from fin_news.core.enums import ArticleStatus
+    from fin_news.core.timeutil import now_utc
+
+    await init_db()
+    async with session_scope() as session:
+        article = await _get_article(session, article_id)
+        if article is None:
+            print(f"文章不存在：{article_id}")
+            return 1
+        article.status = ArticleStatus(new_status)
+        if new_status == ArticleStatus.PUBLISHED.value:
+            article.published_at = now_utc()
+        await session.flush()
+    print(f"文章 #{article.id}《{article.title}》状态已更新为 {new_status}")
+    return 0
+
+
+async def _article_show(article_id: str) -> int:
+    from fin_news.core.db import init_db, session_scope
+
+    await init_db()
+    async with session_scope() as session:
+        article = await _get_article(session, article_id)
+        if article is None:
+            print(f"文章不存在：{article_id}")
+            return 1
+        title, summary, status, content = article.title, article.summary, article.status.value, article.content
+    print(f"《{title}》  [{status}]")
+    if summary:
+        print(f"摘要：{summary}")
+    print("-" * 72)
+    print(content)
+    return 0
+
+
+async def _get_article(session, article_id: str):
+    """按数字 id 或 public_id 定位文章。"""
+    from uuid import UUID
+
+    from sqlalchemy import select
+
+    from fin_news.models.wechat import WechatArticle
+
+    if article_id.isdigit():
+        stmt = select(WechatArticle).where(WechatArticle.id == int(article_id))
+    else:
+        try:
+            uid = UUID(article_id)
+        except ValueError:
+            return None
+        stmt = select(WechatArticle).where(WechatArticle.public_id == uid)
+    return (await session.execute(stmt)).scalar_one_or_none()
+
+
 async def _dispatch(args: argparse.Namespace) -> int:
     logger = get_logger(_LOG_NAME)
     if args.command == "ingest":
@@ -1104,41 +1238,56 @@ async def _dispatch(args: argparse.Namespace) -> int:
         return await _cmd_status()
     if args.command == "selftest":
         return await _cmd_selftest()
+    if args.command == "article":
+        return await _cmd_article(args)
     logger.info("未知命令，打印用法", command=args.command)
     logger.info(__doc__)
     return 1
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="fin-news-v5 命令行工具")
-    parser.add_argument(
-        "command",
-        choices=[
-            "ingest",
-            "pipeline",
-            "worker",
-            "score",
-            "embed",
-            "sweep",
-            "premarket",
-            "postmarket",
-            "status",
-            "selftest",
-        ],
-    )
-    parser.add_argument(
-        "--limit", type=int, default=None, help="score/embed：本轮最多处理的资讯条数（默认取配置值）"
-    )
-    parser.add_argument(
-        "--apply", action="store_true", help="sweep：实际执行修正（默认只扫描不修改）"
-    )
-    parser.add_argument(
+    # 共享的 -v 参数放在 parent 里，使 -v 在子命令前后都能解析。
+    # default=SUPPRESS：count 动作会从主解析器已解析到的值继续累加，且子解析器
+    # 不会用默认值覆盖主解析器已解析到的 -v。
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument(
         "-v",
         "--verbose",
         action="count",
-        default=0,
+        default=argparse.SUPPRESS,
         help="增加日志详细程度：-v=DEBUG，-vv=DEBUG 并放开第三方库日志",
     )
+
+    parser = argparse.ArgumentParser(description="fin-news-v5 命令行工具", parents=[common])
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("ingest", parents=[common])
+    sub.add_parser("pipeline", parents=[common])
+    sub.add_parser("worker", parents=[common])
+    p_score = sub.add_parser("score", parents=[common])
+    p_score.add_argument("--limit", type=int, default=None, help="本轮最多处理的资讯条数")
+    p_embed = sub.add_parser("embed", parents=[common])
+    p_embed.add_argument("--limit", type=int, default=None, help="本轮最多处理的资讯条数")
+    p_sweep = sub.add_parser("sweep", parents=[common])
+    p_sweep.add_argument("--apply", action="store_true", help="实际执行修正（默认只扫描不修改）")
+    sub.add_parser("premarket", parents=[common])
+    sub.add_parser("postmarket", parents=[common])
+    sub.add_parser("status", parents=[common])
+    sub.add_parser("selftest", parents=[common])
+
+    # 微信公众号文章命令族
+    p_article = sub.add_parser("article", help="微信公众号文章")
+    article_sub = p_article.add_subparsers(dest="article_action", required=True)
+    article_sub.add_parser("list", help="列出文章")
+    p_write = article_sub.add_parser("write", help="写一篇文章")
+    p_write.add_argument("--date", default=None, help="交易日 YYYY-MM-DD，默认今天")
+    p_write.add_argument("--skills-dir", default=None, help="skills 目录")
+    p_status = article_sub.add_parser("status", help="修改文章状态")
+    p_status.add_argument("article_id", help="文章 id（list 第一列）或 public_id")
+    p_status.add_argument("new_status", choices=["NEW", "DRAFT", "PUBLISHED", "DELETED"])
+    p_show = article_sub.add_parser("show", help="查看文章内容")
+    p_show.add_argument("article_id", help="文章 id（list 第一列）或 public_id")
+
     args = parser.parse_args()
 
     # 先按 verbosity 配置日志，再执行命令（保证 -v/-vv 对命令内日志生效）

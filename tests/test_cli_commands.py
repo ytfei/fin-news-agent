@@ -48,7 +48,7 @@ def test_dispatch_covers_every_command():
     source = inspect.getsource(_dispatch)
     for command in (
         "ingest", "pipeline", "worker", "score", "embed", "sweep",
-        "premarket", "postmarket", "status", "selftest",
+        "premarket", "postmarket", "status", "selftest", "article",
     ):
         assert f'"{command}"' in source, f"_dispatch 缺少 {command} 分支"
 
@@ -59,6 +59,7 @@ def test_module_docstring_lists_new_commands():
 
     assert "cli embed" in (cli.__doc__ or "")
     assert "cli sweep" in (cli.__doc__ or "")
+    assert "cli article" in (cli.__doc__ or "")
     assert "--apply" in (cli.__doc__ or "")
 
 

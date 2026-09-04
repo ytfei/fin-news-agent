@@ -101,6 +101,16 @@ AGENT_SPECS: dict[AgentType, AgentSpec] = {
         timeout_seconds=600,
         note="盘后复盘：同上，attribution 归因与 verdict 定调走 extras",
     ),
+    AgentType.WECHAT_ARTICLE: AgentSpec(
+        agent_type=AgentType.WECHAT_ARTICLE,
+        framework="deepagents",
+        model_role="analysis",
+        prompt_version="wechat.v1",
+        # 写文章是多轮工具调用（资讯检索 + 历史文章回顾）+ 长文输出，步数/时长预算放宽
+        recursion_limit=100,
+        timeout_seconds=600,
+        note="微信公众号文章：检索资讯+历史文章，写有活人感的每日汇总（含 skills 挂载）",
+    ),
     AgentType.QA: AgentSpec(
         agent_type=AgentType.QA,
         # 追问依赖 SSE 流式 + 多轮 RAG，尚未图化；设计文档 P4 终态为 LangGraph RAG

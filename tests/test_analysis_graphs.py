@@ -64,13 +64,14 @@ def test_analysis_payload_model_dump_is_json_friendly():
 
 
 def test_agent_graph_config_covers_all_graph_agents():
-    """图配置覆盖所有走 DeepAgents 的 Agent：3 个分析 + 盘前/盘后。"""
+    """图配置覆盖所有走 DeepAgents 的 Agent：3 个分析 + 盘前/盘后 + 公众号文章。"""
     assert set(AGENT_GRAPH_CONFIG) == {
         AgentType.MACRO_POLICY,
         AgentType.INDUSTRY,
         AgentType.STOCK,
         AgentType.PRE_MARKET,
         AgentType.POST_MARKET,
+        AgentType.WECHAT_ARTICLE,
     }
 
 

@@ -116,6 +116,22 @@ async def market_snapshot(trade_date: str = "") -> str:
     return json.dumps(data, ensure_ascii=False)
 
 
+@tool
+@_tool_error_guard
+async def article_search(query: str, top_k: int = 8) -> str:
+    """检索我（本公众号）历史已发布的文章片段。输入自然语言查询，返回相关历史文章标题与片段。
+
+    写新文章前用它回顾「我之前写过什么」，可引用「我之前的文章里讲过 xx」，避免重复讲解。
+    只能检索到已发布（PUBLISHED）的历史文章。
+    """
+    from fin_news.agents.tools.article_retrieval import article_search as _search
+    from fin_news.agents.tools.article_retrieval import format_article_hits
+
+    async with session_scope() as session:
+        hits = await _search(session, query, top_k=min(max(1, top_k), 20))
+        return format_article_hits(hits)
+
+
 def build_toolset(agent_type: str) -> list:
     """按 Agent 类型装配工具（控制成本：只有宏观 Agent 默认开放联网检索）。"""
     settings = get_settings()

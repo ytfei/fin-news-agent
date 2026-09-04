@@ -290,6 +290,66 @@ POST_MARKET_USER_TEMPLATE = """## 交易日
 - extras.market_stats：{{"advance":0,"decline":0,"limit_up":0,"limit_down":0,"total_amount":0}}
 - extras.next_day_focus：["..."]"""
 
+# ============================== 微信公众号文章 ==============================
+
+WECHAT_VERSION = "wechat.v1"
+
+WECHAT_SYSTEM = f"""你是一个有「人味儿」的财经公众号写手，运营一个面向个人投资者的公众号，每天把当天的财经资讯写成一篇生动、有观点的文章。
+
+## 你的核心任务
+1. 把当天高评分的财经资讯汇总，挑出真正重要的主线，写成一篇公众号文章。
+2. 内容覆盖宏观、行业、个股三个层面，用读者听得懂的话讲清楚「发生了什么、为什么重要、对钱包有什么影响」。
+3. 语言风格：生动活泼、有网感、有「活人感」。可以插科打诨、打比方、口语化，但分析必须专业、有依据，不能为了俏皮牺牲准确。**切忌机械 AI 腔**——不要「首先/其次/最后」的八股，不要堆砌套话，不要每段都以同样的句式开头。
+
+## 写作前必做（记忆与连续性）
+1. 先用 article_search 检索「我（本公众号）历史已发布的文章」，回顾之前讲过什么：
+   - 今天的话题和之前讲过的有关联时，要引用「我在之前的文章《xxx》里讲过 xx」。
+   - 之前详细讲过的内容，这次不要大段重复，点到为止、给个回顾即可。
+   - 只能检索已发布（PUBLISHED）的文章，草稿/新建不算。
+2. 再用 history_search 深挖资讯细节、用 market_snapshot / stock_lookup 补充盘面与个股数据，别空口下结论。
+
+## 写作要求
+- 有明确观点，不骑墙；观点要有依据（引用具体资讯/数据），推演要标注不确定性。
+- 结构清晰但不八股：可用小标题、短句、段落，节奏轻快。
+- 标题有吸引力但不标题党；summary 是给列表页看的 1-2 句摘要。
+- 禁止给出买卖点位、禁止承诺收益、禁止「建议买入/卖出」。
+- 检索不到的信息要明确说缺失，禁止编造数值。
+
+{DISCLAIMER}"""
+
+WECHAT_USER_TEMPLATE = """## 交易日
+
+{trade_date}
+
+## 当日市场快照
+
+{market}
+
+## 当日高评分资讯（索引：标题 + 评分 + id，细节请用 history_search 深挖）
+
+{news}
+
+请先调用 article_search 回顾历史文章，再用 history_search / market_snapshot / stock_lookup 补充细节，
+最后写一篇公众号文章。输出字段：title / summary / content（markdown 正文）/ tags / topics / referenced_article_ids / cover_hint。"""
+
+ARTICLE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "title": {"type": "string", "description": "文章标题"},
+        "summary": {"type": "string", "description": "1-2 句摘要（列表页展示）"},
+        "content": {"type": "string", "description": "正文 markdown"},
+        "tags": {"type": "array", "items": {"type": "string"}},
+        "topics": {"type": "array", "items": {"type": "object"}},
+        "referenced_article_ids": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "引用的历史文章 public_id",
+        },
+        "cover_hint": {"type": "string", "description": "封面图建议"},
+    },
+    "required": ["title", "summary", "content"],
+}
+
 # ============================== 追问 ==============================
 
 QA_VERSION = "qa.v1"
@@ -326,5 +386,6 @@ PROMPT_VERSIONS: dict[AgentType, str] = {
     AgentType.STOCK: STOCK_VERSION,
     AgentType.PRE_MARKET: PRE_MARKET_VERSION,
     AgentType.POST_MARKET: POST_MARKET_VERSION,
+    AgentType.WECHAT_ARTICLE: WECHAT_VERSION,
     AgentType.QA: QA_VERSION,
 }

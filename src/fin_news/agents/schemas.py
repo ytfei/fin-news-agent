@@ -79,3 +79,20 @@ class AnalysisPayload(_Base):
     impact_level: Literal["high", "medium", "low"] = "medium"
     horizon: Literal["intraday", "short", "medium", "long"] = "short"
     extras: dict[str, object] = Field(default_factory=dict)
+
+
+class ArticlePayload(_Base):
+    """微信公众号文章的结构化输出。
+
+    content 是完整正文 markdown（活人感风格），title/summary 供列表页展示。
+    referenced_article_ids 记录引用的历史文章 public_id（记忆/连续性溯源）。
+    """
+
+    title: str = ""
+    summary: str = ""
+    content: str = Field(default="", description="公众号正文（markdown）")
+    tags: list[str] = Field(default_factory=list)
+    # 宏观 / 行业 / 个股 等主题段落（可选结构化标注）
+    topics: list[dict[str, object]] = Field(default_factory=list)
+    referenced_article_ids: list[str] = Field(default_factory=list)
+    cover_hint: str | None = Field(default=None, description="封面图建议（供后续图片 skill 使用）")
