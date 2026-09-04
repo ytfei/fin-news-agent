@@ -2,9 +2,9 @@ import { useState } from 'react';
 import { NavLink, Outlet, useNavigate } from 'react-router-dom';
 
 const NAV = [
-  { to: '/', label: '时间线' },
-  { to: '/pre-market', label: '盘前' },
-  { to: '/post-market', label: '盘后' },
+  { to: '/', label: '资讯' },
+  { to: '/deep', label: '深度分析' },
+  { to: '/reports', label: '报告' },
   { to: '/chat', label: '追问' },
   { to: '/eval', label: '评估集' },
 ];

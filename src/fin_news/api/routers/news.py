@@ -1,27 +1,115 @@
-"""资讯接口：列表 / 详情 / 关联分析 / 相似资讯。"""
+"""资讯接口：列表 / 渠道聚合 / 详情 / 关联分析 / 相似资讯。"""
 from __future__ import annotations
 
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Query
-from sqlalchemy import func, or_, select
+from sqlalchemy import ColumnElement, exists, func, or_, select
 
 from fin_news.api.deps import PaginationDep, SessionDep
 from fin_news.api.errors import NotFoundError
+from fin_news.api.reporting import (
+    NEWS_ANALYSIS_AGENTS,
+    VISIBLE_REPORT_STATUS,
+    band_rank,
+    order_by_rank,
+)
 from fin_news.api.schemas import (
     EntityOut,
     NewsDetailOut,
     NewsItemOut,
+    NewsSourceOut,
     Page,
     RelatedNewsOut,
     ScoreHistoryOut,
 )
-from fin_news.core.enums import AgentType, ReportStatus, ScoreBand
+from fin_news.core.enums import ScoreBand
 from fin_news.core.timeutil import now
 from fin_news.models.analysis import AnalysisReport
 from fin_news.models.news import NewsEntity, NewsItem, NewsScore
 
 router = APIRouter(prefix="/news", tags=["news"])
+
+
+def _analysis_exists() -> ColumnElement[bool]:
+    """该资讯是否存在「可见的深度分析报告」。
+
+    以 AnalysisReport 实表为唯一真实来源，不再依赖 news_item.analysis_status —— 该字段
+    只在失败路径写入 FAILED，成功路径未维护，与报告表可能不一致。
+    """
+    return exists(
+        select(AnalysisReport.id).where(
+            AnalysisReport.news_id == NewsItem.id,
+            AnalysisReport.agent_type.in_(NEWS_ANALYSIS_AGENTS),
+            AnalysisReport.status.in_(VISIBLE_REPORT_STATUS),
+        )
+    ).correlate(NewsItem)
+
+
+def _order_keys(sort: str, order: str) -> list[ColumnElement]:
+    """排序键（含二级键）。
+
+    末位追加主键：保证同分 / 同时刻的记录顺序完全确定，offset 分页不会重复或漏数据。
+    """
+    if sort == "impact":
+        keys: list[ColumnElement] = [
+            band_rank(NewsItem.band),  # 重要程度：宏观 > 行业 > 个股 > 噪声
+            NewsItem.score,
+            NewsItem.publish_time,
+        ]
+    elif sort == "score":
+        keys = [NewsItem.score, NewsItem.publish_time]
+    else:
+        keys = [NewsItem.publish_time]
+    keys.append(NewsItem.id)
+    return order_by_rank(keys, order)
+
+
+def _build_filters(
+    *,
+    start: datetime | None = None,
+    end: datetime | None = None,
+    band: list[ScoreBand] | None = None,
+    min_score: int | None = None,
+    max_score: int | None = None,
+    source: list[str] | None = None,
+    q: str | None = None,
+    code: str | None = None,
+    has_analysis: bool | None = None,
+    default_since: datetime | None = None,
+) -> list[ColumnElement]:
+    """列表与渠道聚合共用的过滤条件。
+
+    时间语义：给了 start 就按 start 起，给了 end 就按 end 止，两者都没给才回落到
+    default_since（近 N 小时）。
+    """
+    conds: list[ColumnElement] = []
+
+    if start is not None:
+        conds.append(NewsItem.publish_time >= start)
+    elif default_since is not None:
+        conds.append(NewsItem.publish_time >= default_since)
+    if end is not None:
+        conds.append(NewsItem.publish_time <= end)
+
+    if band:
+        conds.append(NewsItem.band.in_(band))
+    if min_score is not None:
+        conds.append(NewsItem.score >= min_score)
+    if max_score is not None:
+        conds.append(NewsItem.score <= max_score)
+    if source:
+        conds.append(NewsItem.src.in_(source))
+    if q:
+        pattern = f"%{q}%"
+        conds.append(or_(NewsItem.title.ilike(pattern), NewsItem.content.ilike(pattern)))
+    if code:
+        conds.append(NewsItem.id.in_(select(NewsEntity.news_id).where(NewsEntity.code == code)))
+    if has_analysis is not None:
+        cond = _analysis_exists()
+        conds.append(cond if has_analysis else ~cond)
+
+    return conds
 
 
 @router.get("", response_model=Page[NewsItemOut], summary="资讯流")
@@ -33,64 +121,40 @@ async def list_news(
     max_score: int | None = Query(default=None, ge=1, le=10),
     start: datetime | None = Query(default=None),
     end: datetime | None = Query(default=None),
-    source: list[str] | None = Query(default=None, description="来源标识 cls / wallstreetcn"),
+    source: list[str] | None = Query(default=None, description="渠道标识 cls / wallstreetcn"),
     q: str | None = Query(default=None, description="标题关键词"),
     code: str | None = Query(default=None, description="关联标的代码"),
     has_analysis: bool | None = Query(default=None),
     sort: str = Query(default="publish_time", pattern="^(publish_time|score|impact)$"),
     order: str = Query(default="desc", pattern="^(asc|desc)$"),
 ):
+    conds = _build_filters(
+        start=start,
+        end=end,
+        band=band,
+        min_score=min_score,
+        max_score=max_score,
+        source=source,
+        q=q,
+        code=code,
+        has_analysis=has_analysis,
+        default_since=now() - timedelta(days=1),  # 未指定时间范围时取近 24 小时
+    )
+
     stmt = select(NewsItem)
     count_stmt = select(func.count()).select_from(NewsItem)
-
-    if start or end:
-        stmt = stmt.where(NewsItem.publish_time >= (start or now() - timedelta(days=1)))
-        count_stmt = count_stmt.where(NewsItem.publish_time >= (start or now() - timedelta(days=1)))
-        if end:
-            stmt = stmt.where(NewsItem.publish_time <= end)
-            count_stmt = count_stmt.where(NewsItem.publish_time <= end)
-    else:
-        # 默认近 24 小时
-        since = now() - timedelta(days=1)
-        stmt = stmt.where(NewsItem.publish_time >= since)
-        count_stmt = count_stmt.where(NewsItem.publish_time >= since)
-
-    if band:
-        stmt = stmt.where(NewsItem.band.in_(band))
-        count_stmt = count_stmt.where(NewsItem.band.in_(band))
-    if min_score is not None:
-        stmt = stmt.where(NewsItem.score >= min_score)
-        count_stmt = count_stmt.where(NewsItem.score >= min_score)
-    if max_score is not None:
-        stmt = stmt.where(NewsItem.score <= max_score)
-        count_stmt = count_stmt.where(NewsItem.score <= max_score)
-    if source:
-        stmt = stmt.where(NewsItem.src.in_(source))
-        count_stmt = count_stmt.where(NewsItem.src.in_(source))
-    if q:
-        pattern = f"%{q}%"
-        cond = or_(NewsItem.title.ilike(pattern), NewsItem.content.ilike(pattern))
+    for cond in conds:
         stmt = stmt.where(cond)
         count_stmt = count_stmt.where(cond)
-    if code:
-        subq = select(NewsEntity.news_id).where(NewsEntity.code == code)
-        stmt = stmt.where(NewsItem.id.in_(subq))
-        count_stmt = count_stmt.where(NewsItem.id.in_(subq))
-
-    if sort == "score":
-        key = NewsItem.score
-    elif sort == "impact":
-        key = NewsItem.score
-    else:
-        key = NewsItem.publish_time
-    stmt = stmt.order_by(key.desc() if order == "desc" else key.asc())
 
     total = int((await session.execute(count_stmt)).scalar_one() or 0)
-    stmt = stmt.offset(pagination.offset).limit(pagination.page_size)
-    items = (await session.execute(stmt)).scalars().all()
-
-    if has_analysis is not None:
-        items = [i for i in items if i.analysis_status == "DONE"] if has_analysis else items
+    items = (
+        (await session.execute(
+            stmt.order_by(*_order_keys(sort, order)).offset(pagination.offset).limit(pagination.page_size)
+        ))
+        .scalars()
+        .all()
+    )
 
     news_ids = [i.id for i in items]
     analysis_map = await _latest_analysis(session, news_ids)
@@ -103,6 +167,42 @@ async def list_news(
         has_more=(pagination.offset + len(items)) < total,
         items=[_to_out(i, analysis_map.get(i.id), entity_map.get(i.id, [])) for i in items],
     )
+
+
+@router.get("/sources", response_model=list[NewsSourceOut], summary="渠道聚合（含各渠道条数）")
+async def list_news_sources(
+    session: SessionDep,
+    start: datetime | None = Query(default=None),
+    end: datetime | None = Query(default=None),
+    band: list[ScoreBand] | None = Query(default=None),
+    min_score: int | None = Query(default=None, ge=1, le=10),
+    has_analysis: bool | None = Query(default=None),
+):
+    """资讯流顶部的渠道标签及其条数。
+
+    过滤参数与 GET /news 对齐（不含分页 / 排序），保证「标签上的数字」与「切到该标签
+    后列表的实际条数」一致。
+    """
+    conds = _build_filters(
+        start=start,
+        end=end,
+        band=band,
+        min_score=min_score,
+        has_analysis=has_analysis,
+        default_since=now() - timedelta(days=1),
+    )
+    # src 为空的记录无法归类到任何渠道标签，直接排除
+    conds.append(NewsItem.src.is_not(None))
+
+    rows = (
+        await session.execute(
+            select(NewsItem.src, func.max(NewsItem.src_name), func.count())
+            .where(*conds)
+            .group_by(NewsItem.src)
+            .order_by(func.count().desc(), NewsItem.src.asc())
+        )
+    ).all()
+    return [NewsSourceOut(src=r[0], src_name=r[1], count=int(r[2] or 0)) for r in rows]
 
 
 @router.get("/{news_id}", response_model=NewsDetailOut, summary="资讯详情")
@@ -166,9 +266,10 @@ async def get_news_analysis(news_id: str, session: SessionDep):
             select(AnalysisReport)
             .where(
                 AnalysisReport.news_id == news.id,
-                AnalysisReport.status == ReportStatus.PUBLISHED,
+                AnalysisReport.agent_type.in_(NEWS_ANALYSIS_AGENTS),
+                AnalysisReport.status.in_(VISIBLE_REPORT_STATUS),
             )
-            .order_by(AnalysisReport.published_at.desc())
+            .order_by(AnalysisReport.published_at.desc().nullslast())
         )
     ).scalars().first()
     if report is None:
@@ -207,12 +308,10 @@ async def _latest_analysis(session, news_ids: list[int]) -> dict[int, AnalysisRe
         select(AnalysisReport)
         .where(
             AnalysisReport.news_id.in_(news_ids),
-            AnalysisReport.agent_type.in_(
-                [AgentType.MACRO_POLICY, AgentType.INDUSTRY, AgentType.STOCK]
-            ),
-            AnalysisReport.status.in_([ReportStatus.PUBLISHED, ReportStatus.DEGRADED]),
+            AnalysisReport.agent_type.in_(NEWS_ANALYSIS_AGENTS),
+            AnalysisReport.status.in_(VISIBLE_REPORT_STATUS),
         )
-        .order_by(AnalysisReport.published_at.desc())
+        .order_by(AnalysisReport.published_at.desc().nullslast())
     )
     result: dict[int, AnalysisReport] = {}
     for report in rows.scalars().all():
@@ -241,7 +340,7 @@ def _to_out(news: NewsItem, report: AnalysisReport | None, entities: list[Entity
     return NewsItemOut(
         id=str(news.public_id),
         title=news.title,
-        summary=(news.content or "")[:120] or news.title,
+        summary=_ellipsis((news.content or "").strip(), 120) or news.title,
         source=news.source,
         src=news.src,
         src_name=news.src_name,
@@ -259,3 +358,10 @@ def _to_out(news: NewsItem, report: AnalysisReport | None, entities: list[Entity
         analysis_id=str(report.public_id) if report else None,
         seen_count=news.seen_count,
     )
+
+
+def _ellipsis(text: str, limit: int) -> str:
+    """按字符数截断并补省略号（中文场景不按字节切，避免半个字）。"""
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "…"

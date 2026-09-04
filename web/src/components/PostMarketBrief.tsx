@@ -1,7 +1,5 @@
-import { useQuery } from '@tanstack/react-query';
-import { api } from '../api/client';
-import type { PostMarketBrief } from '../api/types';
-import { Disclaimer, ErrorBox, Loading } from '../components/Common';
+import type { PostMarketBrief as PostMarketBriefData } from '../api/types';
+import { fmtAmount } from '../lib/band';
 
 const STATE_LABEL: Record<string, { text: string; cls: string }> = {
   up: { text: '上涨', cls: 'up' },
@@ -10,16 +8,8 @@ const STATE_LABEL: Record<string, { text: string; cls: string }> = {
   volatile: { text: '震荡', cls: 'flat' },
 };
 
-export function PostMarket() {
-  const { data, isLoading, error } = useQuery({
-    queryKey: ['post-market'],
-    queryFn: () => api.get<PostMarketBrief>('/market/post-market'),
-  });
-
-  if (isLoading) return <Loading />;
-  if (error) return <ErrorBox error={error} />;
-  if (!data) return null;
-
+/** 盘后复盘正文：一句话结论 + 市场统计 + 涨跌归因 + 次日关注 */
+export function PostMarketBrief({ data }: { data: PostMarketBriefData }) {
   const s = (v: unknown) => (v == null ? '—' : String(v));
   const verdict = data.verdict ?? {};
   const state = String(verdict.state ?? 'flat');
@@ -29,11 +19,13 @@ export function PostMarket() {
     | undefined;
 
   return (
-    <div>
+    <>
       <div className="card">
         <h3 className="card-title">盘后复盘 · {data.trade_date ?? ''}</h3>
-        <h2 style={{ margin: '8px 0' }}>{data.title}</h2>
-        {data.summary && <p style={{ color: '#4b5563', lineHeight: 1.7 }}>{data.summary}</p>}
+        <h2 style={{ margin: '8px 0', fontSize: 19, fontWeight: 600 }}>{data.title}</h2>
+        {data.summary && (
+          <p style={{ color: '#4b5563', lineHeight: 1.75, margin: 0 }}>{data.summary}</p>
+        )}
 
         {verdict.one_liner != null && (
           <div className="news-reason" style={{ fontSize: 14, padding: 14, marginTop: 12 }}>
@@ -60,7 +52,7 @@ export function PostMarket() {
               <div className="label">跌停</div>
             </div>
             <div className="stat">
-              <div className="num">{s(marketStats.total_amount)}</div>
+              <div className="num">{fmtAmount(marketStats.total_amount as number | string | null)}</div>
               <div className="label">成交额(亿)</div>
             </div>
           </div>
@@ -108,8 +100,6 @@ export function PostMarket() {
           </ul>
         </div>
       )}
-
-      <Disclaimer />
-    </div>
+    </>
   );
 }

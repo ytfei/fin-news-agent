@@ -1,25 +1,16 @@
-import { useQuery } from '@tanstack/react-query';
-import { api } from '../api/client';
-import type { PreMarketBrief } from '../api/types';
-import { Disclaimer, ErrorBox, Loading } from '../components/Common';
+import type { PreMarketBrief as PreMarketBriefData } from '../api/types';
 import { fmtPct, pctClass } from '../lib/band';
 
-export function PreMarket() {
-  const { data, isLoading, error } = useQuery({
-    queryKey: ['pre-market'],
-    queryFn: () => api.get<PreMarketBrief>('/market/pre-market'),
-  });
-
-  if (isLoading) return <Loading />;
-  if (error) return <ErrorBox error={error} />;
-  if (!data) return null;
-
+/** 盘前展望正文：标题摘要 + 隔夜美股行情网格 + 今日关注方向 */
+export function PreMarketBrief({ data }: { data: PreMarketBriefData }) {
   return (
-    <div>
+    <>
       <div className="card">
         <h3 className="card-title">盘前展望 · {data.trade_date ?? ''}</h3>
-        <h2 style={{ margin: '8px 0' }}>{data.title}</h2>
-        {data.summary && <p style={{ color: '#4b5563', lineHeight: 1.7 }}>{data.summary}</p>}
+        <h2 style={{ margin: '8px 0', fontSize: 19, fontWeight: 600 }}>{data.title}</h2>
+        {data.summary && (
+          <p style={{ color: '#4b5563', lineHeight: 1.75, margin: 0 }}>{data.summary}</p>
+        )}
       </div>
 
       {data.us_market.length > 0 && (
@@ -58,7 +49,7 @@ export function PreMarket() {
               <div style={{ flex: 1 }}>
                 <div style={{ fontWeight: 500 }}>{String(d.direction ?? d.title ?? '')}</div>
                 {d.reason != null && (
-                  <div className="muted" style={{ marginTop: 4 }}>
+                  <div className="muted" style={{ marginTop: 4, lineHeight: 1.6 }}>
                     {String(d.reason)}
                   </div>
                 )}
@@ -67,8 +58,6 @@ export function PreMarket() {
           ))}
         </div>
       )}
-
-      <Disclaimer />
-    </div>
+    </>
   );
 }

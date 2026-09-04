@@ -23,7 +23,10 @@ export interface NewsItem {
   src?: string | null;
   src_name?: string | null;
   kind?: string | null;
+  channels?: string | null;
   publish_time: string;
+  ingested_at?: string | null;
+  url?: string | null;
   score?: number | null;
   band?: string | null;
   score_reason?: string | null;
@@ -33,6 +36,80 @@ export interface NewsItem {
   analysis_summary?: string | null;
   analysis_id?: string | null;
   seen_count: number;
+}
+
+/** 渠道聚合项：资讯页顶部渠道标签的数据源（GET /news/sources） */
+export interface NewsSource {
+  src: string | null;
+  src_name: string | null;
+  count: number;
+}
+
+export interface NewsDetail extends NewsItem {
+  content?: string | null;
+  content_truncated: boolean;
+  score_history: ScoreHistory[];
+  related_news: RelatedNews[];
+}
+
+export interface ScoreHistory {
+  score: number;
+  band?: string | null;
+  reason?: string | null;
+  model?: string | null;
+  prompt_version?: string | null;
+  created_at?: string | null;
+}
+
+export interface RelatedNews {
+  id: string;
+  title: string;
+  publish_time?: string | null;
+  score?: number | null;
+  similarity: number;
+}
+
+/** 深度分析列表项（GET /analysis/deep） */
+export interface DeepAnalysisItem {
+  id: string;
+  agent_type: string;
+  news_id?: string | null;
+  news_title?: string | null;
+  news_source?: string | null;
+  news_publish_time?: string | null;
+  title: string;
+  summary: string;
+  score?: number | null;
+  band?: string | null;
+  sentiment?: string | null;
+  impact_level?: string | null;
+  horizon?: string | null;
+  confidence?: number | null;
+  beneficiaries: ImpactTarget[];
+  victims: ImpactTarget[];
+  entities: Array<Record<string, unknown>>;
+  bullets: string[];
+  published_at?: string | null;
+  disclaimer: string;
+}
+
+/** 简报历史归档项（GET /market/briefs） */
+export interface BriefMeta {
+  trade_date: string;
+  period: string;
+  report_id: string;
+  title: string;
+  summary: string;
+  published_at?: string | null;
+}
+
+/** 简报统一包装（GET /market/brief）：无数据时 available=false，前端渲染空态而非报错 */
+export interface BriefResponse {
+  available: boolean;
+  trade_date?: string | null;
+  period: string;
+  brief: PreMarketBrief | PostMarketBrief | null;
+  message?: string | null;
 }
 
 export interface ImpactTarget {

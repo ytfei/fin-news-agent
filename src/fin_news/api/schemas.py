@@ -65,6 +65,14 @@ class NewsItemOut(_Base):
     seen_count: int = 1
 
 
+class NewsSourceOut(_Base):
+    """渠道聚合项：资讯流顶部的渠道标签（财联社 / 华尔街见闻 …）及其计数。"""
+
+    src: str | None = None
+    src_name: str | None = None
+    count: int = 0
+
+
 class RelatedNewsOut(_Base):
     id: str
     title: str
@@ -119,6 +127,31 @@ class AnalysisDetailOut(AnalysisReportOut):
     content: dict[str, Any] = Field(default_factory=dict)
     external_sources: list[dict[str, Any]] = Field(default_factory=list)
     run: dict[str, Any] | None = None
+
+
+class DeepAnalysisOut(_Base):
+    """深度分析列表项：报告字段 + 原资讯上下文 + 要点预览（列表页一次取足，避免 N+1）。"""
+
+    id: str
+    agent_type: str
+    news_id: str | None = None
+    news_title: str | None = None
+    news_source: str | None = None
+    news_publish_time: datetime | None = None
+    title: str
+    summary: str
+    score: int | None = None
+    band: str | None = None
+    sentiment: str | None = None
+    impact_level: str | None = None
+    horizon: str | None = None
+    confidence: float | None = None
+    beneficiaries: list[ImpactTargetOut] = Field(default_factory=list)
+    victims: list[ImpactTargetOut] = Field(default_factory=list)
+    entities: list[dict[str, Any]] = Field(default_factory=list)
+    bullets: list[str] = Field(default_factory=list)
+    published_at: datetime | None = None
+    disclaimer: str = "AI 生成，仅供参考，不构成投资建议。"
 
 
 class IndexQuoteOut(_Base):
@@ -183,6 +216,16 @@ class PostMarketBriefOut(AnalysisDetailOut):
     verdict: dict[str, Any] = Field(default_factory=dict)
     attribution: list[dict[str, Any]] = Field(default_factory=list)
     next_day_focus: list[str] = Field(default_factory=list)
+
+
+class BriefOut(_Base):
+    """简报统一包装：无数据时 available=False + HTTP 200（前端渲染空态而非错误框）。"""
+
+    available: bool = False
+    trade_date: date | None = None
+    period: str = ""
+    brief: PreMarketBriefOut | PostMarketBriefOut | None = None
+    message: str | None = None
 
 
 class SearchRequest(BaseModel):
