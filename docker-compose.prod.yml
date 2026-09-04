@@ -43,7 +43,7 @@ services:
 
   # 后端：API + 调度器 + worker 三合一
   app:
-    image: ghcr.io/ytfei/fin-news-agent-app:v1.0.2-alpha
+    image: ghcr.io/ytfei/fin-news-agent-app:v1.0.3-alpha
     container_name: fin-news-app
     restart: unless-stopped
     env_file: .env
@@ -65,7 +65,7 @@ services:
 
   # 前端：nginx 托管静态资源 + /api 反代到 app
   web:
-    image: ghcr.io/ytfei/fin-news-agent-web:v1.0.2-alpha
+    image: ghcr.io/ytfei/fin-news-agent-web:v1.0.3-alpha
     container_name: fin-news-web
     restart: unless-stopped
     depends_on:
