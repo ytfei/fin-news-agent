@@ -188,6 +188,9 @@ class Settings(BaseSettings):
     use_deep_agents: bool = True
     analysis_concurrency: int = 4
     analysis_timeout_seconds: int = 300
+    # 跳过「已有当前版本有效报告」的资讯，避免重复分析烧钱。
+    # 关掉可强制重跑（如改了 prompt 后想让全部资讯重新分析）。
+    analysis_skip_existing: bool = True
     # 盘前/盘后简报：走 ReAct 深度分析（多轮工具调用 + 子 agent 并行），
     # 耗时预算比逐条资讯分析更宽松
     brief_timeout_seconds: int = 1800

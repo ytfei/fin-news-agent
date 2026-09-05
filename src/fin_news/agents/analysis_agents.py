@@ -45,9 +45,18 @@ MAX_CONTENT_CHARS = 3000
 
 
 async def analyze_news(
-    session: AsyncSession, news: NewsItem, settings: Settings | None = None
+    session: AsyncSession,
+    news: NewsItem,
+    settings: Settings | None = None,
+    *,
+    market_json: str | None = None,
 ) -> AnalysisReport | None:
-    """对单条资讯执行深度分析，并落库。"""
+    """对单条资讯执行深度分析，并落库。
+
+    market_json：本批共享的市场快照 JSON 字符串。同一交易日内所有资讯的市场
+    快照完全相同，批量并发分析时由调用方预取一次传入，可省掉 N-1 次重复查询。
+    不传时内部自行查询（行为与原先完全一致）。
+    """
     settings = settings or get_settings()
     agent_type = agent_for_score(news.score)
     if agent_type is None:
@@ -73,7 +82,7 @@ async def analyze_news(
         prompt_version=version,
         timeout_seconds=settings.analysis_timeout_seconds,
     ) as out:
-        context = await _build_context(session, news, agent_type, settings)
+        context = await _build_context(session, news, agent_type, settings, market_json=market_json)
         user_prompt = user_template.format(**context)
         logger.debug(
             "分析上下文已构建",
@@ -121,14 +130,23 @@ async def analyze_news(
 
 
 async def analyze_news_by_id(
-    session: AsyncSession, news_id: int, settings: Settings | None = None
+    session: AsyncSession,
+    news_id: int,
+    settings: Settings | None = None,
+    *,
+    market_json: str | None = None,
 ) -> AnalysisReport | None:
+    """按 id 查出资讯再分析。
+
+    并发安全：内部自己查 NewsItem，调用方只要给每个并发任务一个**独立 session**
+    即可（AsyncSession 不是并发安全的，不能多个协程共用同一个）。
+    """
     news = (
         await session.execute(select(NewsItem).where(NewsItem.id == news_id))
     ).scalar_one_or_none()
     if news is None:
         return None
-    return await analyze_news(session, news, settings)
+    return await analyze_news(session, news, settings, market_json=market_json)
 
 
 # ----------------------------------------------------------------------
@@ -184,20 +202,32 @@ async def _run_analysis(
 
 # ----------------------------------------------------------------------
 async def _build_context(
-    session: AsyncSession, news: NewsItem, agent_type: AgentType, settings: Settings
+    session: AsyncSession,
+    news: NewsItem,
+    agent_type: AgentType,
+    settings: Settings,
+    *,
+    market_json: str | None = None,
 ) -> dict:
+    """构建分析上下文。
+
+    market_json 由批量调用方预取一次后共享：同一交易日内所有资讯的市场快照
+    完全相同，逐条查询等于把同一条 SQL 执行 N 遍。传入时跳过查询（等价优化）。
+    """
     title = news.title or ""
     content, _ = truncate(news.content or title, MAX_CONTENT_CHARS)
 
     # 市场快照：廉价（纯 DB 查询）且确定需要，保留预取。
     # 历史检索 / 外部检索已交给 Agent 的工具按需调用（不再预取塞进 prompt，
     # 避免「预取一份 + Agent 再查一遍」的 token 翻倍——见 05-agent-refactor-design.md 2.7）。
-    try:
-        trade_date = await latest_trade_date(session) or date.today()
-        market = await market_snapshot(session, trade_date)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("市场快照获取失败", error=str(exc)[:200])
-        market = {}
+    if market_json is None:
+        try:
+            trade_date = await latest_trade_date(session) or date.today()
+            market = await market_snapshot(session, trade_date)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("市场快照获取失败", error=str(exc)[:200])
+            market = {}
+        market_json = json.dumps(market, ensure_ascii=False)[:2000]
 
     return {
         "title": title,
@@ -206,7 +236,7 @@ async def _build_context(
         "score": news.score,
         "band": news.band.value if news.band else "",
         "content": content,
-        "market": json.dumps(market, ensure_ascii=False)[:2000],
+        "market": market_json,
     }
 
 
