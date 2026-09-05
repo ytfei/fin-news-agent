@@ -30,6 +30,7 @@ from fin_news.domain.scoring import agent_for_score
 from fin_news.domain.textutil import truncate
 from fin_news.models.analysis import AnalysisReport
 from fin_news.models.news import NewsItem
+from fin_news.observability import AgentRunTracker, digest_of
 
 logger = get_logger("agents.analysis")
 
@@ -81,7 +82,17 @@ async def analyze_news(
             prompt_chars=len(user_prompt),
         )
 
-        output: AgentOutput = await _run_analysis(agent_type, system_prompt, user_prompt, settings)
+        # 运行埋点：包住「真正的 LLM 执行」，因此延迟含降级重试的完整耗时，
+        # 与用户感知一致。埋点自身异常不会冒泡（见 tracker 实现）。
+        async with AgentRunTracker(
+            agent_type,
+            subject_type="news",
+            subject_id=str(news.id),
+            prompt_version=version,
+            input_digest=digest_of(user_prompt),
+        ) as run:
+            output: AgentOutput = await _run_analysis(agent_type, system_prompt, user_prompt, settings)
+            run.finish(output)
         out.update(
             path="deepagents" if not output.degraded else "legacy(降级)",
             model=output.model,

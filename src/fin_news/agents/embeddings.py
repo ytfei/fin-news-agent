@@ -34,15 +34,13 @@ from typing import Any
 import httpx
 
 from fin_news.agents.llm.client import LLMUnavailable
+from fin_news.agents.llm.pricing import calc_cost_cent
 from fin_news.core.config import Settings, get_settings
 from fin_news.core.db import session_scope
-from fin_news.core.logging import get_logger
+from fin_news.core.logging import current_run_id, get_logger
 from fin_news.models.event import LLMCallLog
 
 logger = get_logger("agents.embedding")
-
-# 粗略成本估算（分/千 token），与 llm/callbacks.py 的 embedding 单价一致
-_EMBEDDING_PRICE_PER_1K_CENT = 0.01
 
 
 class DimensionMismatch(ValueError):
@@ -247,6 +245,7 @@ class Embedder:
         self._pending_logs.append(
             LLMCallLog(
                 trace_id=uuid.uuid4().hex[:16],
+                run_id=current_run_id(),
                 provider=self.settings.embedding_provider,
                 role="embedding",
                 model=model,
@@ -257,7 +256,8 @@ class Embedder:
                 latency_ms=latency_ms,
                 status=status,
                 error_message=error,
-                cost_cent=round(prompt_tokens / 1000 * _EMBEDDING_PRICE_PER_1K_CENT, 4),
+                # embedding 只有输入 token，输出按 0 计
+                cost_cent=calc_cost_cent(model, prompt_tokens, 0),
             )
         )
 

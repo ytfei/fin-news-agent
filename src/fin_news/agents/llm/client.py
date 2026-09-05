@@ -16,9 +16,10 @@ from typing import Any, Literal
 
 from openai import APIConnectionError, APIError, AsyncOpenAI, RateLimitError
 
+from fin_news.agents.llm.pricing import calc_cost_cent
 from fin_news.core.config import Settings, get_settings
 from fin_news.core.db import session_scope
-from fin_news.core.logging import get_logger
+from fin_news.core.logging import current_run_id, get_logger
 from fin_news.models.event import LLMCallLog
 
 logger = get_logger("agents.llm")
@@ -267,7 +268,9 @@ class LLMClient:
                 session.add(
                     LLMCallLog(
                         trace_id=trace_id or uuid.uuid4().hex[:16],
-                        run_id=run_id,
+                        # 未显式传入时回落到上下文里的 run_id（由 AgentRunTracker 绑定），
+                        # 使本次调用可归属到某次 Agent 运行
+                        run_id=run_id or current_run_id(),
                         provider=result.provider,
                         role=role,
                         model=result.model,
@@ -278,26 +281,13 @@ class LLMClient:
                         latency_ms=result.latency_ms,
                         status=status,
                         error_message=error,
-                        cost_cent=_estimate_cost_cent(role, result),
+                        cost_cent=calc_cost_cent(
+                            result.model, result.prompt_tokens, result.completion_tokens
+                        ),
                     )
                 )
         except Exception as exc:  # noqa: BLE001 - 审计失败不影响主流程
             logger.warning("写入模型调用日志失败", error=str(exc)[:200])
-
-
-# 粗略成本估算（分）；按 provider 单价表配置即可，这里按量级估算
-_PRICE_PER_1K_CENT = {
-    "scoring": 0.05,
-    "analysis": 0.6,
-    "qa": 0.6,
-    "embedding": 0.01,
-}
-
-
-def _estimate_cost_cent(role: str, result: ChatResult) -> float:
-    rate = _PRICE_PER_1K_CENT.get(role, 0.5)
-    tokens = (result.prompt_tokens or 0) + (result.completion_tokens or 0)
-    return round(tokens / 1000 * rate, 4)
 
 
 _client: LLMClient | None = None

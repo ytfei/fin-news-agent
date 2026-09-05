@@ -13,20 +13,13 @@ from typing import Any
 from langchain_core.callbacks import AsyncCallbackHandler
 from langchain_core.outputs import LLMResult
 
+from fin_news.agents.llm.pricing import calc_cost_cent
 from fin_news.core.db import session_scope
-from fin_news.core.logging import get_logger
+from fin_news.core.logging import current_run_id, get_logger
 from fin_news.models.event import LLMCallLog
 
 logger = get_logger("agents.llm.callbacks")
 trace_logger = get_logger("agents.trace")
-
-# 粗略成本估算（分/千 token），与 client.py 保持一致
-_PRICE_PER_1K_CENT = {
-    "scoring": 0.05,
-    "analysis": 0.6,
-    "qa": 0.6,
-    "embedding": 0.01,
-}
 
 
 class AuditCallbackHandler(AsyncCallbackHandler):
@@ -108,14 +101,15 @@ class AuditCallbackHandler(AsyncCallbackHandler):
         status: str,
         error: str | None = None,
     ) -> None:
-        rate = _PRICE_PER_1K_CENT.get(self.role, 0.5)
-        cost = round((prompt_tokens + completion_tokens) / 1000 * rate, 4)
         try:
             async with session_scope() as session:
                 session.add(
                     LLMCallLog(
                         trace_id=trace_id,
-                        run_id=self.run_id,
+                        # 本 handler 常驻在缓存的 ChatModel 上（见 llm/factory.py），
+                        # 被所有 run 共享，构造时的 run_id 只作兜底；真正生效的是
+                        # 上下文里的 run_id（AgentRunTracker 绑定），并发下按 task 隔离
+                        run_id=self.run_id or current_run_id(),
                         provider=provider,
                         role=self.role,
                         model=model,
@@ -126,7 +120,7 @@ class AuditCallbackHandler(AsyncCallbackHandler):
                         latency_ms=latency_ms,
                         status=status,
                         error_message=error,
-                        cost_cent=cost,
+                        cost_cent=calc_cost_cent(model, prompt_tokens, completion_tokens),
                         estimated=estimated,
                     )
                 )

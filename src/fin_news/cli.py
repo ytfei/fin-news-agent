@@ -487,6 +487,8 @@ async def _cmd_status() -> int:
     settings = get_settings()
     threshold = settings.score_threshold_vectorize
     SAMPLE = 10
+    # Agent 健康指标的统计窗口（天）
+    AGENT_WINDOW_DAYS = 7
 
     async with session_scope() as session:
         async def count_news(*conds) -> int:
@@ -696,7 +698,16 @@ async def _cmd_status() -> int:
             present_kinds.add(kind.value)
         kind_order = [k.value for k in IngestKind if k.value in present_kinds]
 
-        # 8) 接入位点
+        # 9) Agent 健康指标（近 N 天）
+        # agent_run 是本轮才启用的埋点表，历史为空；llm_call_log 有全量历史，
+        # 两者一起展示，保证面板上线即有数据可看。
+        from fin_news.observability import agent_health, llm_summary, report_quality
+
+        agent_rows = await agent_health(session, days=AGENT_WINDOW_DAYS)
+        llm_rows = await llm_summary(session, days=AGENT_WINDOW_DAYS)
+        quality_rows = await report_quality(session)
+
+        # 10) 接入位点
         cursors = list((await session.execute(select(IngestCursor))).scalars().all())
 
     # ---------------- 渲染 ----------------
@@ -715,6 +726,34 @@ async def _cmd_status() -> int:
     def _r(s, width: int) -> str:
         s = str(s)
         return " " * max(0, width - _w(s)) + s
+
+    def _table(headers: list[str], rows: list[list[str]]) -> list[str]:
+        """渲染等宽表格：首列左对齐、其余右对齐，列宽按内容自适应（中文按 2 列算）。
+
+        之所以统一在这里渲染：状态报告里有渠道分布 / Agent 健康 / 模型调用 /
+        报告质量等多张表，各自算列宽会重复四段相同代码，且容易对齐不一致。
+        """
+        widths = [
+            max(_w(h), max((_w(r[i]) for r in rows), default=0)) + 2
+            for i, h in enumerate(headers)
+        ]
+        lines = [
+            "  "
+            + _l(headers[0], widths[0])
+            + "".join(_r(h, widths[i]) for i, h in enumerate(headers[1:], start=1)),
+            "  " + "-" * sum(widths),
+        ]
+        for r in rows:
+            lines.append(
+                "  "
+                + _l(r[0], widths[0])
+                + "".join(_r(c, widths[i]) for i, c in enumerate(r[1:], start=1))
+            )
+        return lines
+
+    def _fmt_ms(ms: int) -> str:
+        """毫秒转人类可读：>=1s 显示秒（保留 1 位），否则显示毫秒。"""
+        return f"{ms / 1000:.1f}s" if ms >= 1000 else f"{ms}ms"
 
     W = 28
     out: list[str] = []
@@ -772,13 +811,7 @@ async def _cmd_status() -> int:
         + [str(sum(channel_bands[n][k] for n in channel_order)) for k in band_keys]
         + [str(sum(channel_kinds.get(n, {}).get(k, 0) for n in channel_order)) for k in kind_order]
     )
-    widths = [
-        max(_w(h), max(_w(r[i]) for r in rows)) + 2 for i, h in enumerate(headers)
-    ]
-    out.append("  " + _l(headers[0], widths[0]) + "".join(_r(h, widths[i]) for i, h in enumerate(headers[1:], 1)))
-    out.append("  " + "-" * sum(widths))
-    for r in rows:
-        out.append("  " + _l(r[0], widths[0]) + "".join(_r(r[i], widths[i]) for i in range(1, len(r))))
+    out.extend(_table(headers, rows))
 
     # 四、生命周期漏斗
     out.append("")
@@ -795,9 +828,92 @@ async def _cmd_status() -> int:
     out.append(f"  {'│     └─ 未向量化':<{W - 2}}{not_embedded}")
     out.append(f"  {'└─ 未评分':<{W - 2}}{unscored}")
 
-    # 五、事件队列
+    # 五、Agent 健康
     out.append("")
-    out.append("【五、事件队列】")
+    out.append(f"【五、Agent 健康】近 {AGENT_WINDOW_DAYS} 天")
+
+    if agent_rows:
+        out.append("  按 Agent（数据源 agent_run）")
+        out.extend(
+            _table(
+                ["Agent", "运行", "成功%", "降级%", "失败%", "P50", "P95", "最高", "成本(分)"],
+                [
+                    [
+                        r.agent_type,
+                        str(r.runs),
+                        f"{r.ok_rate:.1f}",
+                        f"{r.degraded_rate:.1f}",
+                        f"{r.failed_rate:.1f}",
+                        _fmt_ms(r.p50_ms),
+                        _fmt_ms(r.p95_ms),
+                        _fmt_ms(r.max_ms),
+                        f"{r.cost_cent_total:.1f}",
+                    ]
+                    for r in agent_rows
+                ],
+            )
+        )
+    else:
+        out.append("  agent_run 暂无数据 —— 埋点已启用，深度分析 / 简报 Agent 每次运行会写入。")
+        out.append("  当前可先看下方「按模型调用」（llm_call_log 有全量历史）。")
+
+    if llm_rows:
+        out.append("")
+        out.append("  按模型调用（数据源 llm_call_log，覆盖埋点启用前的历史）")
+        out.extend(
+            _table(
+                ["角色", "模型", "调用", "错误%", "平均延迟", "P95", "输入tok", "输出tok", "成本(分)"],
+                [
+                    [
+                        r.role,
+                        r.model or "-",
+                        str(r.calls),
+                        f"{r.error_rate:.1f}",
+                        _fmt_ms(r.avg_latency_ms),
+                        _fmt_ms(r.p95_ms),
+                        str(r.prompt_tokens),
+                        str(r.completion_tokens),
+                        f"{r.cost_cent_total:.1f}",
+                    ]
+                    for r in llm_rows
+                ],
+            )
+        )
+        # model 为空时 SQL 已 COALESCE 成 '-'，此处还原成可读文案
+        unpriced = [
+            r.model if r.model and r.model != "-" else "(未知模型)" for r in llm_rows if not r.priced
+        ]
+        if unpriced:
+            out.append(f"  [提示] 未配置单价（成本按兜底值估算）：{'、'.join(unpriced)}")
+            out.append("        请在 .env 的 MODEL_PRICING 补充，单位 元/百万token，"
+                       '例：MODEL_PRICING={"doubao-seed-evolving":{"input":1.0,"output":4.0}}')
+
+    if quality_rows:
+        out.append("")
+        out.append("  报告质量分布（数据源 analysis_report，全量）")
+        counts = {(r.agent_type, r.status): r.n for r in quality_rows}
+        rows: list[list[str]] = []
+        for a in sorted({r.agent_type for r in quality_rows}):
+            pub = counts.get((a, "PUBLISHED"), 0)
+            deg = counts.get((a, "DEGRADED"), 0)
+            sup = counts.get((a, "SUPERSEDED"), 0)
+            # 降级率分母只算「生效中」的报告：SUPERSEDED 是被新版取代的旧版本，
+            # 计入分母会稀释真实降级率
+            effective = pub + deg
+            rows.append(
+                [
+                    a,
+                    str(pub),
+                    str(deg),
+                    str(sup),
+                    f"{100.0 * deg / effective:.1f}" if effective else "-",
+                ]
+            )
+        out.extend(_table(["Agent", "正常", "降级", "已取代", "降级率%"], rows))
+
+    # 六、事件队列
+    out.append("")
+    out.append("【六、事件队列】")
     header = f"  {'类型':<20}{'PENDING':>9}{'PROC':>7}{'DONE':>8}{'FAILED':>8}{'合计':>8}"
     out.append(header)
     out.append("  " + "-" * (len(header) - 2))
@@ -812,9 +928,9 @@ async def _cmd_status() -> int:
         )
     out.append(f"  积压 pending={backlog['pending']}  overdue={backlog['overdue']}  dead_letter={backlog['dead_letter']}")
 
-    # 六、异常检测
+    # 七、异常检测
     out.append("")
-    out.append("【六、异常检测】")
+    out.append("【七、异常检测】")
     anomalies: list[str] = []
     anomaly_details: list[str] = []
     if noise_stuck:
@@ -852,9 +968,9 @@ async def _cmd_status() -> int:
     else:
         out.append("  [OK] 未发现明显异常，链路已闭环")
 
-    # 七、接入位点
+    # 八、接入位点
     out.append("")
-    out.append("【七、接入位点】")
+    out.append("【八、接入位点】")
     for c in cursors:
         # cursor_time 是 timestamptz，asyncpg 读回为 UTC，需显式转到业务时区展示
         cursor_time = to_market_tz(c.cursor_time).strftime("%Y-%m-%d %H:%M:%S")
@@ -867,6 +983,91 @@ async def _cmd_status() -> int:
     out.append("=" * 72)
     print("\n".join(out))
     return 1 if anomalies else 0
+
+
+async def _cmd_cost_recalc(*, apply: bool) -> int:
+    """按当前 model_pricing 重算 llm_call_log 的历史成本。
+
+    用途：单价是**配置**而非代码，校准单价后需要把历史成本刷新一遍 —— 否则
+    「历史成本」与「新成本」两套口径并存，日成本趋势图会出现人为断崖。
+
+    token 已真实落库（estimated 占比极低），所以重算不损失精度；幂等，可重复执行。
+    """
+    from sqlalchemy import text
+
+    from fin_news.agents.llm.pricing import price_of
+    from fin_news.core.db import init_db, session_scope
+    from fin_news.core.logging import get_logger
+
+    logger = get_logger(_LOG_NAME)
+    await init_db()
+
+    # 单价单位为「元 / 百万 token」，结果要「分」：元 × tokens ÷ 1e6 × 100 = ÷ 1e4
+    _SQL_STATS = text(
+        "SELECT count(*), COALESCE(sum(prompt_tokens),0), COALESCE(sum(completion_tokens),0) "
+        "FROM llm_call_log WHERE COALESCE(model,'') = :model"
+    )
+    # ⚠️ 必须显式 CAST 成 numeric：asyncpg 会把裸的 :in_rate 推断为 integer，
+    # 于是 0.7 被静默截断成 0、1.2 截断成 1 —— 单价恰为整数的模型算对，
+    # 带小数的全错，且**不报错**，成本数据会悄悄失真。踩过一次，勿删 CAST。
+    _SQL_UPDATE = text(
+        """
+        UPDATE llm_call_log
+        SET cost_cent = round(
+            (COALESCE(prompt_tokens,0) * CAST(:in_rate AS numeric)
+             + COALESCE(completion_tokens,0) * CAST(:out_rate AS numeric)) / 10000.0, 4)
+        WHERE COALESCE(model,'') = :model
+        """
+    )
+
+    async with session_scope() as session:
+        models = (
+            await session.execute(text("SELECT DISTINCT COALESCE(model,'') FROM llm_call_log"))
+        ).scalars().all()
+        old_total = float(
+            (await session.execute(text("SELECT COALESCE(sum(cost_cent),0) FROM llm_call_log"))).scalar()
+            or 0
+        )
+
+        rows: list[tuple[str, int, float, float, float]] = []
+        new_total = 0.0
+        for m in models:
+            price = price_of(m)
+            cnt, ptok, ctok = (await session.execute(_SQL_STATS, {"model": m})).one()
+            new_cost = round(
+                ((ptok or 0) * price.input_per_mtok + (ctok or 0) * price.output_per_mtok) / 10000.0,
+                4,
+            )
+            new_total += new_cost
+            rows.append((m or "(空)", int(cnt or 0), new_cost, price.input_per_mtok, price.output_per_mtok))
+
+        # 输出：按调用数降序
+        logger.info(
+            "历史成本重算" + ("" if apply else "（dry-run，未修改）"),
+            models=len(rows),
+            old_total_cent=round(old_total, 2),
+            new_total_cent=round(new_total, 2),
+        )
+        print(f"  {'模型':<26}{'调用':>7}{'入单价':>9}{'出单价':>9}{'新成本(分)':>13}")
+        print("  " + "-" * 64)
+        for m, cnt, cost, in_rate, out_rate in sorted(rows, key=lambda r: -r[1]):
+            print(f"  {m:<26}{cnt:>7}{in_rate:>9}{out_rate:>9}{cost:>13.2f}")
+        print("  " + "-" * 64)
+        print(f"  旧合计 {old_total:.2f} 分  →  新合计 {new_total:.2f} 分")
+
+        if not apply:
+            print("  [dry-run] 未写入。确认无误后加 --apply 执行。")
+            return 0
+
+        for m in models:
+            price = price_of(m)
+            await session.execute(
+                _SQL_UPDATE,
+                {"in_rate": price.input_per_mtok, "out_rate": price.output_per_mtok, "model": m},
+            )
+        logger.info("历史成本已重算", models=len(models), new_total_cent=round(new_total, 2))
+        print(f"  已重算 {len(models)} 个模型的成本。")
+    return 0
 
 
 async def _cmd_selftest() -> int:
@@ -1317,6 +1518,8 @@ async def _dispatch(args: argparse.Namespace) -> int:
         return await _cmd_market("post")
     if args.command == "status":
         return await _cmd_status()
+    if args.command == "cost-recalc":
+        return await _cmd_cost_recalc(apply=getattr(args, "apply", False))
     if args.command == "selftest":
         return await _cmd_selftest()
     if args.command == "article":
@@ -1354,6 +1557,12 @@ def main() -> None:
     sub.add_parser("premarket", parents=[common])
     sub.add_parser("postmarket", parents=[common])
     sub.add_parser("status", parents=[common])
+    p_cost = sub.add_parser(
+        "cost-recalc",
+        parents=[common],
+        help="按当前单价重算历史成本（默认只预览）",
+    )
+    p_cost.add_argument("--apply", action="store_true", help="实际写入（默认只预览不修改）")
     sub.add_parser("selftest", parents=[common])
 
     # 微信公众号文章命令族

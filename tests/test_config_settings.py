@@ -91,6 +91,7 @@ def test_score_and_embed_concurrency_defaults(monkeypatch):
     for key in ("SCORING_SUB_BATCH_SIZE", "EMBEDDING_CONCURRENCY"):
         monkeypatch.delenv(key, raising=False)
     s = Settings(_env_file=None)
-    assert s.scoring_sub_batch_size == 10
+    # 5 而非 10：子批越小单次输出越快、漏评时补打范围越小（见 config 注释）
+    assert s.scoring_sub_batch_size == 5
     assert s.embedding_concurrency == 16
     assert s.embedding_batch_size == 32  # 已弃用但保留兼容 .env

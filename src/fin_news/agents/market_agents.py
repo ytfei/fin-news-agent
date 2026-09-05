@@ -33,6 +33,7 @@ from fin_news.core.enums import AgentType, MarketPeriod, ReportStatus
 from fin_news.core.logging import get_logger, stage
 from fin_news.core.timeutil import now, now_utc
 from fin_news.models.analysis import AnalysisReport
+from fin_news.observability import AgentRunTracker, digest_of
 
 logger = get_logger("agents.market")
 
@@ -92,10 +93,20 @@ async def _build_brief(
     # 内部字段不进模板
     template_ctx = {k: v for k, v in context.items() if not k.startswith("_")}
 
+    user_prompt = user_template.format(**template_ctx)
     async with stage(logger, "执行简报 Agent", period=period.value, agent=agent_type.value):
-        output: AgentOutput = await _run_brief_agent(
-            agent_type, system_prompt, user_template.format(**template_ctx), settings
-        )
+        # 运行埋点：简报以「交易日」为主体，同日重跑覆盖同一条记录（幂等键含 input_digest）
+        async with AgentRunTracker(
+            agent_type,
+            subject_type="brief",
+            subject_id=trade_date.isoformat(),
+            prompt_version=version,
+            input_digest=digest_of(user_prompt),
+        ) as run:
+            output: AgentOutput = await _run_brief_agent(
+                agent_type, system_prompt, user_prompt, settings
+            )
+            run.finish(output)
 
     report = await _persist_brief(session, trade_date, period, agent_type, version, output, context)
     logger.info(

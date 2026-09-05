@@ -87,7 +87,8 @@ async def embed_news_batch(
         await embedder.flush_logs()
 
     results: dict[int, list[list[float]] | BaseException] = {}
-    for (news, _), outcome in zip(tasks, outcomes):
+    # gather(return_exceptions=True) 保证结果与 tasks 一一对应，长度必然相等
+    for (news, _), outcome in zip(tasks, outcomes, strict=True):
         if isinstance(outcome, BaseException):
             if isinstance(outcome, DimensionMismatch):
                 raise outcome  # 整体终止（审计日志已 flush）

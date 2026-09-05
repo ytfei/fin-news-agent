@@ -101,6 +101,10 @@ class AgentRun(Base, TimestampMixin):
     status: Mapped[RunStatus] = mapped_column(run_status_t, nullable=False, default=RunStatus.PENDING)
     attempt: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     priority: Mapped[int] = mapped_column(SmallInteger, nullable=False, default=1)
+    # 「跑完了，但质量降级」：深度分析超时 / 图执行失败后回退到单次结构化调用时置 true。
+    # 这是质量类核心指标（降级率）的数据源，故独立成列而非塞进 payload ——
+    # JSONB 无法高效过滤聚合，而降级率需要按 agent_type 高频统计。
+    degraded: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
     model: Mapped[str | None] = mapped_column(String(64))
     prompt_version: Mapped[str | None] = mapped_column(String(32))

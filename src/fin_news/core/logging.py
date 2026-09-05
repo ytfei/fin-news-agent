@@ -84,6 +84,20 @@ def unbind_context(*keys: str) -> None:
     structlog.contextvars.unbind_contextvars(*keys)
 
 
+def current_run_id() -> str | None:
+    """取当前上下文绑定的 run_id（由 AgentRunTracker 绑定）。
+
+    用途：模型调用分散在深层调用栈里（graph → ChatModel → callback），逐层透传
+    run_id 会污染大量函数签名。改用 contextvars 后，落库侧（AuditCallbackHandler /
+    LLMClient）直接读取即可把每次 LLM 调用归属到某次 Agent 运行。
+
+    并发安全：structlog 的 contextvars 是 context-local 的，asyncio 下每个 task
+    独立持有副本，并发的多个 Agent 运行不会互相串扰。
+    """
+    value = structlog.contextvars.get_contextvars().get("run_id")
+    return str(value) if value else None
+
+
 def elapsed_ms(started: float) -> int:
     return int((time.perf_counter() - started) * 1000)
 

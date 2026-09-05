@@ -44,6 +44,28 @@ def parse_str_list(value: object) -> list[str]:
     return [part.strip().strip("'\"") for part in text.split(",") if part.strip()]
 
 
+def parse_json_dict(value: object) -> dict[str, dict[str, float]]:
+    """把 ".env / 环境变量" 里的 JSON 对象解析成 dict。
+
+    与 parse_str_list 同源的容错：shell source .env 时会吃掉引号，
+    解析失败时静默返回空 dict（回落到代码内默认单价表），不阻断启动。
+    """
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return {str(k): v for k, v in value.items() if isinstance(v, dict)}
+    text = str(value).strip()
+    if not text or text in ("{}", "[]", "null", "None"):
+        return {}
+    try:
+        parsed = json.loads(text)
+    except (ValueError, TypeError):
+        return {}
+    if isinstance(parsed, dict):
+        return {str(k): v for k, v in parsed.items() if isinstance(v, dict)}
+    return {}
+
+
 @dataclass(frozen=True)
 class ProviderConfig:
     """一个 OpenAI 兼容的模型供应商。"""
@@ -148,6 +170,19 @@ class Settings(BaseSettings):
     deepseek_model_analysis: str = "deepseek-chat"
     deepseek_model_qa: str = "deepseek-chat"
 
+    # ---------------- 成本 ----------------
+    # 模型单价（元 / 百万 token，区分 input / output），按 model 名覆盖
+    # agents/llm/pricing.py 里的默认表。
+    #
+    # ⚠️ 默认表是**占位量级**，请按火山方舟 / DeepSeek 控制台的实际单价校准；
+    # 模型会调价，硬编码必然过期（OpenTelemetry GenAI 规范的明确警告）。
+    # 校准后可执行 `fin_news.cli cost-recalc` 按新单价重算历史成本。
+    #
+    # 例：MODEL_PRICING={"doubao-pro-32k":{"input":0.8,"output":2.0}}
+    model_pricing: Annotated[dict[str, dict[str, float]], NoDecode] = Field(
+        default_factory=dict
+    )
+
     # ---------------- Agent ----------------
     # 关闭后，深度分析 Agent 退化为「预取工具结果 + 单次结构化调用」
     use_deep_agents: bool = True
@@ -232,6 +267,11 @@ class Settings(BaseSettings):
     @classmethod
     def _coerce_str_list(cls, value: object) -> list[str]:
         return parse_str_list(value)
+
+    @field_validator("model_pricing", mode="before")
+    @classmethod
+    def _coerce_json_dict(cls, value: object) -> dict[str, dict[str, float]]:
+        return parse_json_dict(value)
 
     # ---------------- 派生方法 ----------------
     def provider(self, name: ProviderName) -> ProviderConfig:
