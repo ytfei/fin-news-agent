@@ -28,6 +28,7 @@ class NewsStatus(StrEnum):
     SCORE_FAILED = "SCORE_FAILED"
     EMBED_FAILED = "EMBED_FAILED"
     ANALYSIS_FAILED = "ANALYSIS_FAILED"
+    EXPIRED = "EXPIRED"  # 超时效窗口、不再自动分析，改由用户手动触发
     DEAD = "DEAD"
 
     @property

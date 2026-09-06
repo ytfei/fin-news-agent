@@ -8,6 +8,7 @@
 | `market_sync` | 每日 16:00（Asia/Shanghai） | 同步最近交易日行情 + 聚合快照 |
 | `pre_market` | 交易日 `pre_market_hour:minute`（默认 07:30） | 生成盘前展望简报 |
 | `post_market` | 交易日 `post_market_hour:minute`（默认 15:30） | 生成盘后复盘简报 |
+| `expire_stale_analysis` | 每 `expire_job_interval_minutes`（默认 30min） | 批量 ACK 超时效窗口的 PENDING 分析事件并标记资讯 EXPIRED |
 
 说明：
 * 事件消费（pipeline worker）不在这里调度，而是由 `main.py` 以常驻 asyncio 任务
@@ -111,6 +112,23 @@ async def job_post_market() -> None:
     logger.info("盘后简报已生成", trade_date=str(date.today()), report_id=report.id)
 
 
+async def job_expire_stale_analysis() -> None:
+    """批量清理超时效窗口的 PENDING news.embedded 事件并标记资讯 EXPIRED。
+
+    时效策略的核心：把有限的分析产能留给「有决策价值的新新闻」，历史旧闻的
+    分析事件不再占用队列，改由用户在 Web / Mobile 手动触发。
+    """
+    from fin_news.core.db import init_db, session_scope
+    from fin_news.services.expire_service import expire_stale_events
+
+    settings = get_settings()
+    await init_db()
+    async with session_scope() as session:
+        await expire_stale_events(
+            session, max_age_hours=settings.analysis_max_age_hours
+        )
+
+
 # ----------------------------------------------------------------------
 # 装配
 # ----------------------------------------------------------------------
@@ -157,6 +175,13 @@ def build_scheduler(settings: Settings | None = None) -> AsyncIOScheduler:
         name="盘后简报",
         replace_existing=True,
     )
+    scheduler.add_job(
+        job_expire_stale_analysis,
+        trigger=IntervalTrigger(minutes=settings.expire_job_interval_minutes),
+        id="expire_stale_analysis",
+        name="过期资讯清理",
+        replace_existing=True,
+    )
 
     logger.info(
         "调度器已装配",
@@ -165,6 +190,8 @@ def build_scheduler(settings: Settings | None = None) -> AsyncIOScheduler:
         market_sync=f"{MARKET_SYNC_HOUR:02d}:{MARKET_SYNC_MINUTE:02d}",
         pre_market=f"{settings.pre_market_hour:02d}:{settings.pre_market_minute:02d}",
         post_market=f"{settings.post_market_hour:02d}:{settings.post_market_minute:02d}",
+        expire_interval_minutes=settings.expire_job_interval_minutes,
+        analysis_max_age_hours=settings.analysis_max_age_hours,
     )
     return scheduler
 

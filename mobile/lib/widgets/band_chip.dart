@@ -39,6 +39,34 @@ class BandChip extends StatelessWidget {
   }
 }
 
+/// 已过期标记：中性灰，不抢分档 / 涨跌语义色（颜色在本项目只传达分档与涨跌）。
+class ExpiredChip extends StatelessWidget {
+  const ExpiredChip({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final color = theme.colorScheme.onSurfaceVariant;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.12),
+        borderRadius: BorderRadius.circular(4),
+        border: Border.all(color: color.withValues(alpha: 0.4)),
+      ),
+      child: Text(
+        '已过期',
+        style: TextStyle(
+          fontSize: 11,
+          height: 1.2,
+          color: color,
+          fontWeight: FontWeight.w500,
+        ),
+      ),
+    );
+  }
+}
+
 /// 来源 + 时间的次要信息行。
 class MetaLine extends StatelessWidget {
   const MetaLine({super.key, required this.source, this.time, this.trailing});

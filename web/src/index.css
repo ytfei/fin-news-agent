@@ -597,6 +597,54 @@ input[type='date'] {
   align-items: center;
 }
 
+/* 过期标记：中性灰，不抢分档 / 涨跌语义色（颜色在本项目只传达分档与涨跌） */
+.chip-expired {
+  background: #f1f5f9;
+  color: var(--text-muted);
+  border: 1px solid #e5e7eb;
+}
+
+/* 次级按钮（生成报告等）：描边样式，区别于主操作按钮 */
+.btn-outline {
+  display: inline-flex;
+  align-items: center;
+  padding: 5px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #fff;
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition:
+    background 120ms ease,
+    border-color 120ms ease;
+}
+
+.btn-outline:hover:not(:disabled) {
+  background: #eff6ff;
+  border-color: #bfdbfe;
+}
+
+.btn-outline:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.btn-block {
+  width: 100%;
+  justify-content: center;
+  padding: 8px 14px;
+}
+
+/* 资讯卡片的操作行：过期标记 + 生成报告按钮 */
+.news-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-top: 10px;
+}
+
 /* ---------- 多行截断 ---------- */
 .clamp-2,
 .clamp-3 {

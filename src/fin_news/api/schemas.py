@@ -63,6 +63,8 @@ class NewsItemOut(_Base):
     analysis_summary: str | None = None
     analysis_id: str | None = None
     seen_count: int = 1
+    status: str | None = None  # 资讯处理状态（前端据此判断是否 EXPIRED）
+    expired: bool = False  # 便捷布尔：status == EXPIRED
 
 
 class NewsSourceOut(_Base):

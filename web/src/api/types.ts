@@ -36,6 +36,8 @@ export interface NewsItem {
   analysis_summary?: string | null;
   analysis_id?: string | null;
   seen_count: number;
+  status?: string | null;
+  expired?: boolean;
 }
 
 /** 渠道聚合项：资讯页顶部渠道标签的数据源（GET /news/sources） */

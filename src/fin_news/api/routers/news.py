@@ -23,10 +23,11 @@ from fin_news.api.schemas import (
     RelatedNewsOut,
     ScoreHistoryOut,
 )
-from fin_news.core.enums import ScoreBand
+from fin_news.core.enums import NewsStatus, ScoreBand
 from fin_news.core.timeutil import now
 from fin_news.models.analysis import AnalysisReport
 from fin_news.models.news import NewsEntity, NewsItem, NewsScore
+from fin_news.services.expire_service import request_analysis
 
 router = APIRouter(prefix="/news", tags=["news"])
 
@@ -258,6 +259,22 @@ async def get_news(news_id: str, session: SessionDep):
     return out
 
 
+@router.post("/{news_id}/analyze", summary="手动触发生成分析报告", status_code=202)
+async def trigger_analysis(
+    news_id: str,
+    session: SessionDep,
+    force: bool = Query(default=False, description="强制重跑（即使已有报告）"),
+):
+    """用户手动触发深度分析，高优先级插队、近实时执行。
+
+    与 admin 的 reanalyze 共用同一插队逻辑（见 services/expire_service），区别是
+    本接口面向普通用户、用 public_id 定位资讯、不受 24 小时时效窗口限制。
+    """
+    news = await _get_news_by_public_id(session, news_id)
+    result = await request_analysis(session, news.id, force=force)
+    return result
+
+
 @router.get("/{news_id}/analysis", summary="该资讯的分析报告")
 async def get_news_analysis(news_id: str, session: SessionDep):
     news = await _get_news_by_public_id(session, news_id)
@@ -357,6 +374,8 @@ def _to_out(news: NewsItem, report: AnalysisReport | None, entities: list[Entity
         analysis_summary=report.summary if report else None,
         analysis_id=str(report.public_id) if report else None,
         seen_count=news.seen_count,
+        status=news.status.value if news.status else None,
+        expired=news.status == NewsStatus.EXPIRED,
     )
 
 

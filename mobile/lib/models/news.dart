@@ -130,6 +130,8 @@ class NewsItem {
     this.analysisSummary,
     this.analysisId,
     required this.seenCount,
+    this.status,
+    this.isExpired = false,
   });
 
   final String id;
@@ -163,6 +165,12 @@ class NewsItem {
   final String? analysisId;
   final int seenCount;
 
+  /// 资讯处理状态（NEW / SCORED / EMBEDDED / ANALYZED / EXPIRED ...）
+  final String? status;
+
+  /// 便捷布尔：status == EXPIRED（已过时效窗口、不再自动分析）
+  final bool isExpired;
+
   factory NewsItem.fromJson(Object? raw) {
     final json = raw is Map ? Map<String, dynamic>.from(raw) : const {};
     final rawEntities = json['entities'];
@@ -188,6 +196,8 @@ class NewsItem {
       analysisSummary: asStringOrNull(json['analysis_summary']),
       analysisId: asStringOrNull(json['analysis_id']),
       seenCount: asInt(json['seen_count'], 1),
+      status: asStringOrNull(json['status']),
+      isExpired: asBool(json['expired']),
     );
   }
 
@@ -217,6 +227,8 @@ class NewsDetail extends NewsItem {
     super.analysisSummary,
     super.analysisId,
     required super.seenCount,
+    super.status,
+    super.isExpired,
     this.content,
     required this.contentTruncated,
     this.url,
@@ -255,6 +267,8 @@ class NewsDetail extends NewsItem {
       analysisSummary: base.analysisSummary,
       analysisId: base.analysisId,
       seenCount: base.seenCount,
+      status: base.status,
+      isExpired: base.isExpired,
       content: asStringOrNull(json['content']),
       contentTruncated: asBool(json['content_truncated']),
       url: asStringOrNull(json['url']),

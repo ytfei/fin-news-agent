@@ -1,5 +1,6 @@
 import type { NewsItem } from '../api/types';
 import { BandTag, ScoreBadge } from './ScoreBadge';
+import { GenerateReportButton } from './GenerateReportButton';
 import { fmtTime, sourceLabel } from '../lib/band';
 
 interface Props {
@@ -23,6 +24,7 @@ function ListRow({ item, onOpen }: { item: NewsItem; onOpen: (item: NewsItem) =>
             <span>{sourceLabel(item)}</span>
             <span>{fmtTime(item.publish_time)}</span>
             {item.seen_count > 1 && <span>重复 {item.seen_count} 次</span>}
+            {item.expired && <span className="chip chip-expired">已过期</span>}
           </div>
           {item.score_reason && <div className="news-reason">{item.score_reason}</div>}
           {item.has_analysis && item.analysis_summary && (
@@ -35,6 +37,11 @@ function ListRow({ item, onOpen }: { item: NewsItem; onOpen: (item: NewsItem) =>
           )}
         </div>
       </div>
+      {!item.has_analysis && (
+        <div className="news-actions">
+          <GenerateReportButton newsId={item.id} />
+        </div>
+      )}
     </div>
   );
 }
@@ -61,7 +68,13 @@ function GridCard({ item, onOpen }: { item: NewsItem; onOpen: (item: NewsItem) =
         <span>·</span>
         <span>{fmtTime(item.publish_time)}</span>
         {item.has_analysis && <span className="chip chip-medium">已分析</span>}
+        {item.expired && <span className="chip chip-expired">已过期</span>}
       </div>
+      {!item.has_analysis && (
+        <div className="news-actions">
+          <GenerateReportButton newsId={item.id} block />
+        </div>
+      )}
     </div>
   );
 }

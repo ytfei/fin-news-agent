@@ -15,6 +15,7 @@ from fin_news.core.logging import get_logger
 from fin_news.core.timeutil import now
 from fin_news.events.bus import EventBus
 from fin_news.models.event import DeadLetter, IngestEvent
+from fin_news.services.expire_service import request_analysis
 
 logger = get_logger("api.admin")
 
@@ -62,9 +63,9 @@ async def rescore(news_id: int, session: SessionDep):
 @router.post("/news/{news_id}/reanalyze", summary="重跑深度分析", status_code=202)
 async def reanalyze(news_id: int, session: SessionDep):
     news = await _get_news_id(session, news_id)
-    bus = EventBus(session)
-    await bus.publish(EventType.NEWS_EMBEDDED, news, payload={"manual": True})
-    return {"news_id": news, "queued": True}
+    # force=True 强制重跑（绕过「已有报告跳过」）；复用 request_analysis 的
+    # 软去重处理：已有 PENDING 事件时提升优先级插队，而非静默失效。
+    return await request_analysis(session, news, force=True)
 
 
 @router.get("/events/backlog", response_model=BacklogOut, summary="事件积压与死信统计")

@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../models/news.dart';
 import 'band_chip.dart';
+import 'generate_report_button.dart';
 
 /// 资讯卡片：来源 / 时间 → 标题 → 摘要 → 分档与已分析标记。
 ///
@@ -64,8 +65,16 @@ class NewsCard extends StatelessWidget {
                       ),
                     ),
                   ],
+                  if (news.isExpired) ...[
+                    const SizedBox(width: 6),
+                    const ExpiredChip(),
+                  ],
                 ],
               ),
+              if (!news.hasAnalysis) ...[
+                const SizedBox(height: 10),
+                GenerateReportButton(newsId: news.id),
+              ],
               if (news.hasAnalysis &&
                   analysisSummary != null &&
                   analysisSummary.isNotEmpty) ...[

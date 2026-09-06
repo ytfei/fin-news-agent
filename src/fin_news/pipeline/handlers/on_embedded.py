@@ -23,7 +23,7 @@ import asyncio
 import json
 import time
 from collections.abc import Awaitable, Callable
-from datetime import date
+from datetime import date, datetime, timedelta
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -35,6 +35,7 @@ from fin_news.core.config import Settings, get_settings
 from fin_news.core.db import session_scope
 from fin_news.core.enums import EventType, NewsStatus, ReportStatus
 from fin_news.core.logging import bind_context, elapsed_ms, get_logger, unbind_context
+from fin_news.core.timeutil import now
 from fin_news.domain.scoring import agent_for_score
 from fin_news.events.bus import EventBus
 from fin_news.models.analysis import AnalysisReport
@@ -98,10 +99,14 @@ async def handle(
     candidate_ids = [n.id for n in items.values() if n.score is not None]
     done_keys = await _existing_report_keys(session, candidate_ids)
 
-    todo: list[tuple[int, int, str]] = []  # (event_id, news_id, agent)
+    todo: list[tuple[int, int, str, datetime]] = []  # (event_id, news_id, agent, publish_time)
     acked = 0
+    expired = 0
     skipped_existing = 0
     skipped_degraded = 0
+    # 时效窗口：analysis_max_age_hours=0 表示关闭时效策略（全量分析）
+    max_age = timedelta(hours=settings.analysis_max_age_hours) if settings.analysis_max_age_hours > 0 else None
+    cutoff = now() - max_age if max_age else None
 
     for event in events:
         news = items.get(event.aggregate_id)
@@ -118,6 +123,21 @@ async def handle(
             acked += 1
             continue
 
+        # 时效兜底：手动触发（payload.manual）不受窗口限制；否则超期资讯不再自动
+        # 分析，标记 EXPIRED 并确认，改由定时任务 / 用户手动触发。
+        # publish_time 带 Asia/Shanghai 时区，cutoff 也来自 now()，两者可直接比较。
+        is_manual = bool(event.payload.get("manual"))
+        if cutoff is not None and not is_manual and news.publish_time < cutoff:
+            news.status = NewsStatus.EXPIRED
+            await bus.ack(event)
+            expired += 1
+            logger.info(
+                "资讯已过时效窗口，标记 EXPIRED",
+                news_id=news.id,
+                publish_time=news.publish_time.isoformat(),
+            )
+            continue
+
         agent_type = agent_for_score(news.score)
         if agent_type is None:
             logger.info("评分未达分析阈值，跳过深度分析", news_id=news.id, score=news.score)
@@ -127,7 +147,9 @@ async def handle(
 
         _system_prompt, _template, version = AGENT_CONFIG[agent_type]
         existing_status = done_keys.get((news.id, agent_type, version))
-        if settings.analysis_skip_existing and existing_status is not None:
+        # force（手动重跑）绕过「已有报告跳过」；否则按配置跳过避免重复烧钱
+        force = bool(event.payload.get("force"))
+        if not force and settings.analysis_skip_existing and existing_status is not None:
             skipped_existing += 1
             if existing_status == ReportStatus.DEGRADED:
                 skipped_degraded += 1
@@ -135,9 +157,15 @@ async def handle(
             acked += 1
             continue
 
-        todo.append((event.id, news.id, agent_type.value))
+        todo.append((event.id, news.id, agent_type.value, news.publish_time))
 
-    await session.commit()  # 统一提交过滤阶段产生的 ack
+    # 最新优先：按发布时间降序，让新新闻先出报告
+    todo.sort(key=lambda item: item[3], reverse=True)
+
+    await session.commit()  # 统一提交过滤阶段产生的 ack 与 EXPIRED 标记
+
+    if expired:
+        logger.info("批量标记过期资讯", expired=expired, window_hours=settings.analysis_max_age_hours)
 
     if skipped_existing:
         # 降级报告也跳过（避免重复烧钱），但单独计数并告警，不让质量问题被藏起来
@@ -145,7 +173,7 @@ async def handle(
             "跳过已有报告的资讯",
             skipped=skipped_existing,
             degraded=skipped_degraded,
-            hint="如需强制重跑请设 ANALYSIS_SKIP_EXISTING=false",
+            hint="如需强制重跑请设 ANALYSIS_SKIP_EXISTING=false 或手动触发",
         )
 
     if not todo:
@@ -180,7 +208,7 @@ async def handle(
                 unbind_context("news_id", "agent")
 
     results = await asyncio.gather(
-        *(_analyze_one(eid, nid, ag) for eid, nid, ag in todo),
+        *(_analyze_one(eid, nid, ag) for eid, nid, ag, _ in todo),
         return_exceptions=True,
     )
 
@@ -204,6 +232,7 @@ async def handle(
         skipped=skipped,
         failed=failed,
         acked=acked,
+        expired=expired,
         skipped_existing=skipped_existing,
         concurrency=settings.analysis_concurrency,
         elapsed_ms=elapsed_ms(started),

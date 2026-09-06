@@ -57,7 +57,9 @@ class _NewsFeedPageState extends ConsumerState<NewsFeedPage> {
     if (reportId == null || reportId.isEmpty) {
       ScaffoldMessenger.of(context)
         ..clearSnackBars()
-        ..showSnackBar(const SnackBar(content: Text('该资讯暂无深度分析')));
+        ..showSnackBar(const SnackBar(
+          content: Text('暂无深度分析，可点击卡片下方的「生成报告」按钮手动生成'),
+        ));
       return;
     }
     Navigator.of(context).push(

@@ -17,14 +17,17 @@ from __future__ import annotations
 import asyncio
 import json
 from contextlib import asynccontextmanager
-from datetime import date
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import pytest
 
 from fin_news.core.config import Settings
-from fin_news.core.enums import AgentType, ReportStatus
+from fin_news.core.enums import AgentType, NewsStatus, ReportStatus
 from fin_news.domain.scoring import agent_for_score
 from fin_news.pipeline.handlers import on_embedded
+
+_MARKET_TZ = ZoneInfo("Asia/Shanghai")
 
 
 # ----------------------------------------------------------------------
@@ -102,9 +105,12 @@ class _FakeBus:
 class _News:
     """只带 handler 所需字段的假资讯（避开 ORM 的必填字段）。"""
 
-    def __init__(self, news_id: int, score: int | None):
+    def __init__(self, news_id: int, score: int | None, publish_time: datetime | None = None):
         self.id = news_id
         self.score = score
+        # 默认「刚发布」，不会命中时效窗口的过期判定
+        self.publish_time = publish_time or datetime.now(tz=_MARKET_TZ)
+        self.status = NewsStatus.EMBEDDED
 
 
 class _Report:
@@ -114,9 +120,10 @@ class _Report:
 
 
 class _Event:
-    def __init__(self, event_id: int, news_id: int):
+    def __init__(self, event_id: int, news_id: int, payload: dict | None = None):
         self.id = event_id
         self.aggregate_id = news_id
+        self.payload = payload or {}
 
 
 def _settings(**kw) -> Settings:
@@ -348,3 +355,112 @@ async def test_prefetch_failure_falls_back_to_none():
             raise RuntimeError("行情库不可用")
 
     assert await on_embedded._prefetch_market(_Boom()) is None
+
+
+# ----------------------------------------------------------------------
+# 时效窗口（EXPIRED）与手动触发
+# ----------------------------------------------------------------------
+async def test_expired_news_is_acked_and_marked_expired(monkeypatch):
+    """超时效窗口的资讯：标记 EXPIRED + ACK，不再调用分析器。"""
+    settings = _settings(analysis_max_age_hours=24)
+    old = datetime.now(tz=_MARKET_TZ) - timedelta(hours=25)
+    items = [_News(1, 6, publish_time=old), _News(2, 6)]
+    events = [_Event(101, 1), _Event(102, 2)]
+
+    called: list[int] = []
+
+    async def analyzer(session, news_id, settings, market_json=None):
+        called.append(news_id)
+        return _Report(news_id * 10)
+
+    sessions: list = []
+    buses: list = []
+    _patch_scope(monkeypatch, sessions)
+    _spy_bus(monkeypatch, buses)
+
+    bus = _FakeBus()
+    await on_embedded.handle(_outer_session(items), events, bus, settings, analyzer=analyzer)
+
+    assert called == [2], f"过期资讯不应分析，实际调用了 {called}"
+    assert 101 in bus.acked, "过期资讯的事件也要确认，否则会一直重试"
+    assert items[0].status == NewsStatus.EXPIRED, "过期资讯应被标记 EXPIRED"
+    assert items[1].status == NewsStatus.EMBEDDED, "未过期资讯状态不应改变"
+
+
+async def test_manual_event_bypasses_expiry(monkeypatch):
+    """手动触发（payload.manual）的资讯即使超期也要分析。"""
+    settings = _settings(analysis_max_age_hours=24)
+    old = datetime.now(tz=_MARKET_TZ) - timedelta(hours=25)
+    items = [_News(1, 6, publish_time=old)]
+    events = [_Event(101, 1, payload={"manual": True})]
+
+    called: list[int] = []
+
+    async def analyzer(session, news_id, settings, market_json=None):
+        called.append(news_id)
+        return _Report(news_id * 10)
+
+    sessions: list = []
+    buses: list = []
+    _patch_scope(monkeypatch, sessions)
+    _spy_bus(monkeypatch, buses)
+
+    bus = _FakeBus()
+    await on_embedded.handle(_outer_session(items), events, bus, settings, analyzer=analyzer)
+
+    assert called == [1], f"手动触发不应被时效窗口拦截，实际调用了 {called}"
+    assert items[0].status == NewsStatus.EMBEDDED, "手动触发不应标记 EXPIRED"
+
+
+async def test_todo_is_sorted_by_publish_time_desc(monkeypatch):
+    """最新优先：todo 按 publish_time 降序，新新闻先出报告。"""
+    settings = _settings(analysis_concurrency=1)
+    now_ = datetime.now(tz=_MARKET_TZ)
+    items = [
+        _News(1, 6, publish_time=now_ - timedelta(hours=2)),
+        _News(2, 6, publish_time=now_ - timedelta(hours=1)),  # 最新
+        _News(3, 6, publish_time=now_ - timedelta(hours=3)),  # 最旧
+    ]
+    events = [_Event(100 + n.id, n.id) for n in items]
+
+    order: list[int] = []
+
+    async def analyzer(session, news_id, settings, market_json=None):
+        order.append(news_id)
+        return _Report(news_id * 10)
+
+    sessions: list = []
+    buses: list = []
+    _patch_scope(monkeypatch, sessions)
+    _spy_bus(monkeypatch, buses)
+
+    await on_embedded.handle(
+        _outer_session(items), events, _FakeBus(), settings, analyzer=analyzer
+    )
+
+    assert order == [2, 1, 3], f"应按发布时间降序执行，实际顺序 {order}"
+
+
+async def test_force_bypasses_existing_report_skip(monkeypatch):
+    """force 标记（手动重跑）绕过「已有报告跳过」。"""
+    settings = _settings(analysis_skip_existing=True)
+    items = [_News(1, 6)]
+    events = [_Event(101, 1, payload={"force": True})]
+    existing = [(1, AgentType.INDUSTRY, "industry.v2", ReportStatus.PUBLISHED)]
+
+    called: list[int] = []
+
+    async def analyzer(session, news_id, settings, market_json=None):
+        called.append(news_id)
+        return _Report(news_id * 10)
+
+    sessions: list = []
+    buses: list = []
+    _patch_scope(monkeypatch, sessions)
+    _spy_bus(monkeypatch, buses)
+
+    await on_embedded.handle(
+        _outer_session(items, existing=existing), events, _FakeBus(), settings, analyzer=analyzer
+    )
+
+    assert called == [1], f"force 标记应绕过已有报告跳过，实际调用了 {called}"

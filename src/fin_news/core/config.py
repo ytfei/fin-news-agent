@@ -191,6 +191,13 @@ class Settings(BaseSettings):
     # 跳过「已有当前版本有效报告」的资讯，避免重复分析烧钱。
     # 关掉可强制重跑（如改了 prompt 后想让全部资讯重新分析）。
     analysis_skip_existing: bool = True
+    # 自动深度分析的时效窗口（小时）：publish_time 距今超过该值的资讯不再自动分析，
+    # 其事件由定时任务批量 ACK、资讯标记为 EXPIRED，改由用户在 Web / Mobile
+    # 手动触发「生成报告」。设为 0 表示关闭时效策略（等同历史行为，全量分析）。
+    analysis_max_age_hours: int = 24
+    # 手动触发「生成报告」时给事件设置的优先级（常规 news.embedded 优先级为 2），
+    # 更高优先级会让它在下一个 poll 周期（≤2 秒）排到队首，实现近实时执行。
+    manual_priority: int = 10
     # 盘前/盘后简报：走 ReAct 深度分析（多轮工具调用 + 子 agent 并行），
     # 耗时预算比逐条资讯分析更宽松
     brief_timeout_seconds: int = 1800
@@ -245,6 +252,9 @@ class Settings(BaseSettings):
     event_max_attempts: int = 5
     event_backoff_base_seconds: int = 30
     event_retention_days: int = 7
+    # 过期事件清理任务：周期性扫描 PENDING 的 news.embedded 事件，把超过时效窗口
+    # 的部分批量 ACK 并把资讯标记为 EXPIRED。单位为分钟。
+    expire_job_interval_minutes: int = 30
 
     # ---------------- 盘前 / 盘后 ----------------
     pre_market_hour: int = 7

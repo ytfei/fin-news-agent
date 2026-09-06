@@ -4,6 +4,7 @@ import { useNavigate } from 'react-router-dom';
 import { api } from '../api/client';
 import type { NewsDetail } from '../api/types';
 import { BandTag, ScoreBadge } from './ScoreBadge';
+import { GenerateReportButton } from './GenerateReportButton';
 import { ErrorBox, Loading } from './Common';
 import { fmtTime, sourceLabel } from '../lib/band';
 
@@ -40,7 +41,14 @@ export function NewsDrawer({ newsId, fallback, onClose, onSelectRelated }: Props
       <aside className="drawer" role="dialog" aria-label="资讯详情">
         <div className="drawer-head">
           <div style={{ flex: 1 }}>
-            <h3>{data?.title ?? fallback.title}</h3>
+            <h3>
+              {data?.title ?? fallback.title}
+              {data?.expired && (
+                <span className="chip chip-expired" style={{ marginLeft: 8 }}>
+                  已过期
+                </span>
+              )}
+            </h3>
             <div className="source-line">
               {data && <span>{sourceLabel(data)}</span>}
               {data && <span>·</span>}
@@ -93,6 +101,22 @@ export function NewsDrawer({ newsId, fallback, onClose, onSelectRelated }: Props
                   >
                     查看完整分析
                   </button>
+                </div>
+              )}
+
+              {!data.has_analysis && (
+                <div className="card">
+                  <div className="section-title" style={{ marginTop: 0 }}>
+                    AI 分析
+                  </div>
+                  <div className="news-reason">
+                    {data.expired
+                      ? '该资讯已过时效窗口，未自动分析；如需深度报告可手动生成。'
+                      : '该资讯尚未生成深度分析，可手动触发生成。'}
+                  </div>
+                  <div style={{ marginTop: 12 }}>
+                    <GenerateReportButton newsId={data.id} block />
+                  </div>
                 </div>
               )}
 
