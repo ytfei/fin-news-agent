@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 from fin_news.core.config import Settings, get_settings
 from fin_news.core.enums import IngestKind
 from fin_news.core.logging import get_logger
-from fin_news.core.timeutil import parse_news_datetime
+from fin_news.core.timeutil import parse_news_datetime, to_market_tz
 from fin_news.domain.schemas import RawItem
 from fin_news.ingestion.sources.base import NewsSource, SourceMeta
 from fin_news.ingestion.tushare_client import TushareClient, get_tushare_client
@@ -21,6 +21,16 @@ from fin_news.ingestion.tushare_client import TushareClient, get_tushare_client
 logger = get_logger("ingestion.source.tushare_news")
 
 SINGLE_LIMIT = 1500
+
+
+def api_dt(dt: datetime) -> str:
+    """把时间格式化成 Tushare 需要的 'YYYY-MM-DD HH:MM:SS'。
+
+    Tushare 的 ``start_date/end_date`` 按北京时间解释，而入参可能来自不同来源：
+    ``now()`` 是 Asia/Shanghai，库里读回的 timestamptz 是 UTC。直接 strftime
+    会按各自时区的墙钟时间输出，导致窗口偏移 8 小时，故统一转换后再格式化。
+    """
+    return to_market_tz(dt).strftime("%Y-%m-%d %H:%M:%S")
 
 # src 标识 -> 中文名
 SRC_NAMES = {
@@ -67,8 +77,8 @@ class TushareNewsSource(NewsSource):
                 logger.error(
                     "拉取窗口失败",
                     src=self.meta.src,
-                    start=start.strftime("%Y-%m-%d %H:%M:%S"),
-                    end=end.strftime("%Y-%m-%d %H:%M:%S"),
+                    start=api_dt(start),
+                    end=api_dt(end),
                     error=str(exc)[:300],
                 )
                 raise
@@ -98,16 +108,16 @@ class TushareNewsSource(NewsSource):
             src=self.meta.src,
             windows=len(windows),
             items=len(items),
-            since=since.strftime("%Y-%m-%d %H:%M:%S"),
-            until=until.strftime("%Y-%m-%d %H:%M:%S"),
+            since=api_dt(since),
+            until=api_dt(until),
         )
         return items
 
     async def _fetch_window(self, start: datetime, end: datetime) -> list[dict]:
         kwargs = {
             "src": self.meta.src,
-            "start_date": start.strftime("%Y-%m-%d %H:%M:%S"),
-            "end_date": end.strftime("%Y-%m-%d %H:%M:%S"),
+            "start_date": api_dt(start),
+            "end_date": api_dt(end),
         }
         started = time.perf_counter()
         df = await self.client.query(self.meta.api_name, **kwargs)
@@ -115,8 +125,8 @@ class TushareNewsSource(NewsSource):
         logger.debug(
             "拉取窗口完成",
             src=self.meta.src,
-            start=start.strftime("%Y-%m-%d %H:%M:%S"),
-            end=end.strftime("%Y-%m-%d %H:%M:%S"),
+            start=api_dt(start),
+            end=api_dt(end),
             records=len(records),
             elapsed_ms=int((time.perf_counter() - started) * 1000),
         )

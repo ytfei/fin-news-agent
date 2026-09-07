@@ -413,7 +413,7 @@ async def test_manual_event_bypasses_expiry(monkeypatch):
 
 
 async def test_todo_is_sorted_by_publish_time_desc(monkeypatch):
-    """最新优先：todo 按 publish_time 降序，新新闻先出报告。"""
+    """复合优先级：同 score 时按发布时间降序（指数衰减单调，新新闻先出报告）。"""
     settings = _settings(analysis_concurrency=1)
     now_ = datetime.now(tz=_MARKET_TZ)
     items = [
@@ -464,3 +464,88 @@ async def test_force_bypasses_existing_report_skip(monkeypatch):
     )
 
     assert called == [1], f"force 标记应绕过已有报告跳过，实际调用了 {called}"
+
+
+# ----------------------------------------------------------------------
+# 复合优先级排序
+# ----------------------------------------------------------------------
+async def test_priority_sorted_by_score_desc(monkeypatch):
+    """复合优先级：时效相同时 score 高的先分析。"""
+    settings = _settings(analysis_concurrency=1)
+    now_ = datetime.now(tz=_MARKET_TZ)
+    items = [
+        _News(1, 6, publish_time=now_),  # INDUSTRY score 6
+        _News(2, 9, publish_time=now_),  # MACRO score 9
+        _News(3, 7, publish_time=now_),  # INDUSTRY score 7
+    ]
+    events = [_Event(100 + n.id, n.id) for n in items]
+
+    order: list[int] = []
+
+    async def analyzer(session, news_id, settings, market_json=None):
+        order.append(news_id)
+        return _Report(news_id * 10)
+
+    sessions: list = []
+    buses: list = []
+    _patch_scope(monkeypatch, sessions)
+    _spy_bus(monkeypatch, buses)
+
+    await on_embedded.handle(
+        _outer_session(items), events, _FakeBus(), settings, analyzer=analyzer
+    )
+
+    assert order == [2, 3, 1], f"应优先评分最高的，实际顺序 {order}"
+
+
+# ----------------------------------------------------------------------
+# STOCK 档（score 4-5）不再自动分析
+# ----------------------------------------------------------------------
+async def test_stock_band_not_auto_analyzed(monkeypatch):
+    """STOCK 档（score 4-5）不再自动分析：标记 EXPIRED + ACK，不调用分析器。"""
+    settings = _settings()
+    items = [_News(1, 5), _News(2, 6)]  # score 5 = STOCK，score 6 = INDUSTRY
+    events = [_Event(101, 1), _Event(102, 2)]
+
+    called: list[int] = []
+
+    async def analyzer(session, news_id, settings, market_json=None):
+        called.append(news_id)
+        return _Report(news_id * 10)
+
+    sessions: list = []
+    buses: list = []
+    _patch_scope(monkeypatch, sessions)
+    _spy_bus(monkeypatch, buses)
+
+    bus = _FakeBus()
+    await on_embedded.handle(_outer_session(items), events, bus, settings, analyzer=analyzer)
+
+    assert called == [2], f"STOCK 档不应自动分析，实际调用了 {called}"
+    assert 101 in bus.acked, "STOCK 档事件也要确认，否则会一直重试"
+    assert items[0].status == NewsStatus.EXPIRED, "STOCK 档应标记 EXPIRED"
+    assert items[1].status == NewsStatus.EMBEDDED, "INDUSTRY 档状态不应改变"
+
+
+async def test_manual_event_bypasses_stock_skip(monkeypatch):
+    """手动触发（payload.manual）的 STOCK 档资讯仍要分析，不标 EXPIRED。"""
+    settings = _settings()
+    items = [_News(1, 5)]  # STOCK
+    events = [_Event(101, 1, payload={"manual": True})]
+
+    called: list[int] = []
+
+    async def analyzer(session, news_id, settings, market_json=None):
+        called.append(news_id)
+        return _Report(news_id * 10)
+
+    sessions: list = []
+    buses: list = []
+    _patch_scope(monkeypatch, sessions)
+    _spy_bus(monkeypatch, buses)
+
+    bus = _FakeBus()
+    await on_embedded.handle(_outer_session(items), events, bus, settings, analyzer=analyzer)
+
+    assert called == [1], f"手动触发不应被 STOCK 档拦截，实际调用了 {called}"
+    assert items[0].status == NewsStatus.EMBEDDED, "手动触发不应标记 EXPIRED"

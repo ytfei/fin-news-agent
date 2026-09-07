@@ -310,7 +310,7 @@ class Settings(BaseSettings):
     event_retention_days: int = 7
     # 过期事件清理任务：周期性扫描 PENDING 的 news.embedded 事件，把超过时效窗口
     # 的部分批量 ACK 并把资讯标记为 EXPIRED。单位为分钟。
-    expire_job_interval_minutes: int = 30
+    expire_job_interval_minutes: int = 5
 
     # ---------------- 盘前 / 盘后 ----------------
     pre_market_hour: int = 7

@@ -34,25 +34,30 @@ async def expire_stale_events(
     max_age_hours: int,
     limit: int = 2000,
 ) -> dict[str, int]:
-    """批量 ACK 超期的 PENDING news.embedded 事件，并把对应资讯标记 EXPIRED。
+    """批量 ACK「不再自动分析」的 PENDING news.embedded 事件并标记 EXPIRED。
+
+    两类事件：
+    1. 低价值个股（STOCK 档，score 4-5）：永不自动分析，改由用户手动触发。
+    2. 超时效窗口（publish_time 距今超过 max_age_hours，仅 max_age_hours > 0 时启用）。
 
     只扫 ``status = PENDING``（不碰 PROCESSING，避免干扰正在执行的分析）；跳过
-    手动触发（``payload.manual``）的事件；``max_age_hours <= 0`` 表示关闭时效
-    策略，直接返回 0。
+    手动触发（``payload.manual``）的事件。
 
     实现要点：先 ACK 事件并 ``RETURNING aggregate_id``，再只用这些「确实被 ACK」
     的资讯 id 去标 EXPIRED——若在两步之间事件恰好被 worker 消费（变 PROCESSING），
     第一步的 ``WHERE status = 'PENDING'`` 会挡住，不会把正在分析的资讯标过期。
     """
-    if max_age_hours <= 0:
-        return {"events_acked": 0, "news_expired": 0}
-
-    cutoff = now() - timedelta(hours=max_age_hours)
+    conditions = ["(n.score > 3 AND n.score <= 5)"]  # STOCK 档（低价值个股）永不自动分析
+    params: dict = {"limit": limit}
+    if max_age_hours > 0:
+        conditions.append("(n.publish_time < :cutoff)")
+        params["cutoff"] = now() - timedelta(hours=max_age_hours)
+    where_clause = " OR ".join(conditions)
 
     acked_news_ids = (
         await session.execute(
             text(
-                """
+                f"""
                 WITH stale AS (
                     SELECT e.id AS event_id, e.aggregate_id AS news_id
                     FROM ingest_event e
@@ -60,7 +65,7 @@ async def expire_stale_events(
                     WHERE e.event_type = 'news.embedded'
                       AND e.status = 'PENDING'
                       AND COALESCE(e.payload->>'manual', 'false') <> 'true'
-                      AND n.publish_time < :cutoff
+                      AND ({where_clause})
                     ORDER BY e.id
                     LIMIT :limit
                 )
@@ -74,7 +79,7 @@ async def expire_stale_events(
                 RETURNING e.aggregate_id
                 """
             ),
-            {"cutoff": cutoff, "limit": limit},
+            params,
         )
     ).scalars().all()
 

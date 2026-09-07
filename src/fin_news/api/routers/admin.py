@@ -12,7 +12,7 @@ from fin_news.api.errors import NotFoundError
 from fin_news.api.schemas import BacklogOut
 from fin_news.core.enums import EventStatus, EventType
 from fin_news.core.logging import get_logger
-from fin_news.core.timeutil import now
+from fin_news.core.timeutil import now, to_market_tz
 from fin_news.events.bus import EventBus
 from fin_news.models.event import DeadLetter, IngestEvent
 from fin_news.services.expire_service import request_analysis
@@ -45,9 +45,11 @@ async def backfill(session: SessionDep, payload: BackfillRequest):
         cursor = await manager.get_or_create(
             source.source_key, default_time=payload.start, kind=source.meta.kind
         )
-        cursor.cursor_time = payload.start
+        # 前端可能传不带时区的时间，统一按业务时区解释，避免依赖数据库会话时区
+        start = to_market_tz(payload.start)
+        cursor.cursor_time = start
         cursor.enabled = True
-        results.append({"source_key": source.source_key, "cursor_time": payload.start.isoformat()})
+        results.append({"source_key": source.source_key, "cursor_time": start.isoformat()})
     logger.info("已回退位点等待补数", sources=results)
     return {"job_id": None, "sources": results}
 

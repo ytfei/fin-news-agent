@@ -12,7 +12,7 @@ from fin_news.core.config import Settings, get_settings
 from fin_news.core.db import session_scope
 from fin_news.core.enums import EventType
 from fin_news.core.logging import get_logger
-from fin_news.core.timeutil import now
+from fin_news.core.timeutil import now, to_market_tz
 from fin_news.domain.schemas import IngestResult
 from fin_news.events.bus import EventBus
 from fin_news.ingestion.cursor import CursorManager
@@ -177,8 +177,11 @@ class IngestionService:
 
     # ------------------------------------------------------------------
     def _window(self, cursor: IngestCursor) -> tuple[datetime, datetime]:
-        until = now()
-        since = cursor.cursor_time - timedelta(seconds=cursor.overlap_seconds)
+        until = now()  # Asia/Shanghai
+        # cursor_time 是 timestamptz，asyncpg 读回一律是 UTC（+00:00），而 now() 是
+        # Asia/Shanghai（+08:00）。两者虽为 aware 可直接相减，但下游数据源要把时间
+        # strftime 成"北京时间字符串"发给 Tushare，若不统一时区会把窗口起点提前 8 小时。
+        since = to_market_tz(cursor.cursor_time) - timedelta(seconds=cursor.overlap_seconds)
         if until - since > MAX_WINDOW:
             logger.warning(
                 "拉取窗口过大，已截断为 24h", source_key=cursor.source_key, since=since.isoformat()

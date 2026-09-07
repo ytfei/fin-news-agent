@@ -182,12 +182,15 @@ def _settings(**kw):
     return Settings(_env_file=None, **base)
 
 
-async def test_expire_stale_events_disabled_when_zero_hours():
-    """analysis_max_age_hours=0 关闭时效策略，直接返回 0 不执行任何 SQL。"""
+async def test_expire_stale_events_stock_band_when_zero_hours():
+    """max_age_hours=0 时仍清理 STOCK 档（score 4-5），但不再有时效条件。"""
     session = _ExpireSession([1, 2, 3])
     result = await expire_stale_events(session, max_age_hours=0)
-    assert result == {"events_acked": 0, "news_expired": 0}
-    assert session.executed_text is None and session.update_calls == 0
+    assert result == {"events_acked": 3, "news_expired": 3}
+    sql = session.executed_text or ""
+    assert "n.score > 3" in sql and "n.score <= 5" in sql, "应清理 STOCK 档"
+    assert "publish_time <" not in sql, "max_age_hours=0 不应有时效条件"
+    assert session.update_calls == 1
 
 
 async def test_expire_stale_events_bulk_sql_shape():
@@ -200,5 +203,6 @@ async def test_expire_stale_events_bulk_sql_shape():
     assert "status = 'PENDING'" in sql, "只扫 PENDING，不碰 PROCESSING"
     assert "payload->>'manual'" in sql, "跳过手动触发的事件"
     assert "publish_time <" in sql, "按 publish_time 判定过期"
+    assert "n.score > 3" in sql and "n.score <= 5" in sql, "应清理 STOCK 档"
     assert "news.embedded" in sql, "只清理分析事件"
     assert session.update_calls == 1, "news_item 的 EXPIRED 更新应执行一次"

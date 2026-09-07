@@ -39,7 +39,7 @@ class BandChip extends StatelessWidget {
   }
 }
 
-/// 已过期标记：中性灰，不抢分档 / 涨跌语义色（颜色在本项目只传达分档与涨跌）。
+/// 未自动分析标记（EXPIRED 状态，涵盖时效过期与低价值两类）：中性灰，不抢分档 / 涨跌语义色。
 class ExpiredChip extends StatelessWidget {
   const ExpiredChip({super.key});
 
@@ -55,7 +55,7 @@ class ExpiredChip extends StatelessWidget {
         border: Border.all(color: color.withValues(alpha: 0.4)),
       ),
       child: Text(
-        '已过期',
+        '未自动分析',
         style: TextStyle(
           fontSize: 11,
           height: 1.2,

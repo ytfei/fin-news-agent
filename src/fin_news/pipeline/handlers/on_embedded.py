@@ -33,7 +33,7 @@ from fin_news.agents.llm import get_semaphore
 from fin_news.agents.tools.market_data import latest_trade_date, market_snapshot
 from fin_news.core.config import Settings, get_settings
 from fin_news.core.db import session_scope
-from fin_news.core.enums import EventType, NewsStatus, ReportStatus
+from fin_news.core.enums import AgentType, EventType, NewsStatus, ReportStatus
 from fin_news.core.logging import bind_context, elapsed_ms, get_logger, unbind_context
 from fin_news.core.timeutil import now
 from fin_news.domain.scoring import agent_for_score
@@ -54,6 +54,27 @@ _ACTIVE_REPORT_STATUS = (
 
 # 单条资讯的分析器：(session, news_id, settings, market_json) -> 报告或 None
 Analyzer = Callable[..., Awaitable[AnalysisReport | None]]
+
+# 时效衰减半衰期（分钟），按 agent 分档：宏观/政策影响衰减快，行业相对持久。
+# STOCK 档（score 4-5）已不再自动分析，此处仅保留默认值供防御性使用。
+_AGENT_HALF_LIFE_MINUTES: dict[str, float] = {
+    AgentType.MACRO_POLICY.value: 30.0,
+    AgentType.INDUSTRY.value: 120.0,
+    AgentType.STOCK.value: 60.0,
+}
+
+
+def _analysis_priority(score: int, publish_time: datetime, agent: str, now_: datetime) -> float:
+    """复合优先级：score × 指数时效衰减（半衰期按分档），越大越先分析。
+
+    短期不引入「交易时段系数」（需交易日历判定盘前/盘后，复杂度高），先靠
+    score 与时效衰减解决「评分高的 + 新的优先」。指数衰减连续无硬边界，
+    29 分钟与 31 分钟不会突然跨档。
+    """
+    half_life = _AGENT_HALF_LIFE_MINUTES.get(agent, 120.0)
+    age_minutes = max(0.0, (now_ - publish_time).total_seconds() / 60.0)
+    decay = 2.0 ** (-age_minutes / half_life)
+    return float(score) * decay
 
 
 async def handle(
@@ -99,7 +120,7 @@ async def handle(
     candidate_ids = [n.id for n in items.values() if n.score is not None]
     done_keys = await _existing_report_keys(session, candidate_ids)
 
-    todo: list[tuple[int, int, str, datetime]] = []  # (event_id, news_id, agent, publish_time)
+    todo: list[tuple[int, int, str, datetime, int]] = []  # (event_id, news_id, agent, publish_time, score)
     acked = 0
     expired = 0
     skipped_existing = 0
@@ -145,6 +166,15 @@ async def handle(
             acked += 1
             continue
 
+        # 低价值个股（STOCK 档，score 4-5）：不再自动分析，标记 EXPIRED 并确认，
+        # 改由用户在 Web / Mobile 手动触发。手动触发（payload.manual）不受此限制。
+        if agent_type == AgentType.STOCK and not is_manual:
+            news.status = NewsStatus.EXPIRED
+            await bus.ack(event)
+            expired += 1
+            logger.info("低价值个股资讯不自动分析，标记 EXPIRED", news_id=news.id, score=news.score)
+            continue
+
         _system_prompt, _template, version = AGENT_CONFIG[agent_type]
         existing_status = done_keys.get((news.id, agent_type, version))
         # force（手动重跑）绕过「已有报告跳过」；否则按配置跳过避免重复烧钱
@@ -157,10 +187,11 @@ async def handle(
             acked += 1
             continue
 
-        todo.append((event.id, news.id, agent_type.value, news.publish_time))
+        todo.append((event.id, news.id, agent_type.value, news.publish_time, news.score))
 
-    # 最新优先：按发布时间降序，让新新闻先出报告
-    todo.sort(key=lambda item: item[3], reverse=True)
+    # 复合优先级排序：score × 时效衰减（半衰期按分档），越大越先分析
+    now_ = now()
+    todo.sort(key=lambda item: _analysis_priority(item[4], item[3], item[2], now_), reverse=True)
 
     await session.commit()  # 统一提交过滤阶段产生的 ack 与 EXPIRED 标记
 
@@ -208,7 +239,7 @@ async def handle(
                 unbind_context("news_id", "agent")
 
     results = await asyncio.gather(
-        *(_analyze_one(eid, nid, ag) for eid, nid, ag, _ in todo),
+        *(_analyze_one(eid, nid, ag) for eid, nid, ag, _pt, _sc in todo),
         return_exceptions=True,
     )
 

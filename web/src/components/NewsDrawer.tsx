@@ -45,7 +45,7 @@ export function NewsDrawer({ newsId, fallback, onClose, onSelectRelated }: Props
               {data?.title ?? fallback.title}
               {data?.expired && (
                 <span className="chip chip-expired" style={{ marginLeft: 8 }}>
-                  已过期
+                  未自动分析
                 </span>
               )}
             </h3>
@@ -111,7 +111,7 @@ export function NewsDrawer({ newsId, fallback, onClose, onSelectRelated }: Props
                   </div>
                   <div className="news-reason">
                     {data.expired
-                      ? '该资讯已过时效窗口，未自动分析；如需深度报告可手动生成。'
+                      ? '该资讯未自动分析，如需深度报告可手动生成。'
                       : '该资讯尚未生成深度分析，可手动触发生成。'}
                   </div>
                   <div style={{ marginTop: 12 }}>
