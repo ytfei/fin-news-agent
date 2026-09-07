@@ -25,22 +25,18 @@ def create_app(settings: Settings | None = None, with_background: bool = True) -
         await init_db()
         stop_event: asyncio.Event | None = None
         worker_task: asyncio.Task | None = None
-        scheduler = None
 
         if with_background and settings.env != "test":
-            from fin_news.ingestion.scheduler import build_scheduler
+            # 注意：调度器已拆到独立的 `python -m fin_news.scheduler` 进程。
+            # 多 worker 部署时定时任务只应由单副本调度器执行，故这里只启动
+            # 事件消费 worker（可多副本，靠 poll 的 SKIP LOCKED 保证不重复）。
             from fin_news.pipeline.worker import PipelineWorker
-
-            scheduler = build_scheduler(settings)
-            scheduler.start()
-            logger.info("调度器已启动", jobs=len(scheduler.get_jobs()))
 
             stop_event = asyncio.Event()
             worker = PipelineWorker(settings)
             worker_task = asyncio.create_task(worker.run_forever(stop_event))
             app.state.pipeline_worker = worker
 
-        app.state.scheduler = scheduler
         try:
             yield
         finally:
@@ -51,9 +47,6 @@ def create_app(settings: Settings | None = None, with_background: bool = True) -
                 except TimeoutError:
                     logger.warning("Pipeline worker 退出超时，强制取消")
                     worker_task.cancel()
-            if scheduler:
-                scheduler.shutdown(wait=False)
-                logger.info("调度器已停止")
             await dispose_engine()
 
     app = FastAPI(

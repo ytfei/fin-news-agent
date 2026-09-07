@@ -1,4 +1,6 @@
-# fin-news-v5 后端镜像：API + APScheduler 调度器 + Pipeline worker 三合一
+# fin-news-v5 后端镜像：一个镜像承载两种进程角色
+#   默认 CMD  → API + Pipeline worker（可多副本）
+#   覆盖 CMD  → 调度器（单副本，见 src/fin_news/scheduler.py）
 # 多阶段构建：base 层装依赖（层缓存复用）→ runtime 层只拷贝产物（镜像更小）
 # 构建：docker build -t fin-news-app .
 
@@ -54,5 +56,10 @@ ENV PATH="/app/.venv/bin:$PATH"
 
 EXPOSE 8000
 
-# 启动前先跑迁移（幂等，alembic 会跳过已应用的版本），再启动三合一服务
-CMD ["sh", "-c", "alembic upgrade head && python -m fin_news.main"]
+# ENTRYPOINT 先跑迁移（幂等，alembic 会跳过已应用版本），再 exec CMD 指定的进程。
+# CMD 决定进程角色：
+#   默认            → python -m fin_news.main（API + worker，可多副本）
+#   覆盖 CMD        → python -m fin_news.scheduler（单副本调度器）
+# exec 让目标进程替换 sh 成为 PID 1，确保 docker stop 的 SIGTERM 能正确送达。
+ENTRYPOINT ["sh", "-c", "alembic upgrade head && exec \"$@\"", "--"]
+CMD ["python", "-m", "fin_news.main"]
