@@ -17,6 +17,7 @@ from fin_news.core.config import Settings, get_settings
 
 _engine: AsyncEngine | None = None
 _session_factory: async_sessionmaker[AsyncSession] | None = None
+_db_initialized = False
 
 
 def get_engine(settings: Settings | None = None) -> AsyncEngine:
@@ -74,11 +75,23 @@ async def session_scope() -> AsyncGenerator[AsyncSession, None]:
 
 
 async def init_db() -> None:
-    """确保扩展存在（建表交给 Alembic 迁移）。"""
+    """确保扩展存在（建表交给 Alembic 迁移）。
+
+    进程内只执行一次，后续调用直接返回（全局标志位）。调度器每个 job 都会调用本
+    函数，若每次都跑两条扩展 SQL 属无谓开销。
+
+    为什么不用锁：`CREATE EXTENSION IF NOT EXISTS` 本身幂等，即便多个协程恰好
+    并发首次调用，重复执行也无副作用，简单布尔标志足够，且避免 asyncio.Lock
+    跨事件循环（多次 asyncio.run）时的绑定报错。
+    """
+    global _db_initialized
+    if _db_initialized:
+        return
     engine = get_engine()
     async with engine.begin() as conn:
         await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
         await conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
+    _db_initialized = True
 
 
 async def check_db() -> bool:
@@ -91,8 +104,9 @@ async def check_db() -> bool:
 
 
 async def dispose_engine() -> None:
-    global _engine, _session_factory
+    global _engine, _session_factory, _db_initialized
     if _engine is not None:
         await _engine.dispose()
     _engine = None
     _session_factory = None
+    _db_initialized = False
