@@ -75,7 +75,16 @@ async def handle(
     )
     for item in pending:
         item.status = NewsStatus.SCORING
-    await session.flush()
+    # 注意：这里**故意不 flush**。
+    #
+    # 若在此 flush，SQLAlchemy 的 greenlet 上下文会残留在当前协程；紧接着评分图
+    # `ainvoke` 里 LangChainTracer 回调做 async IO 时会抛 MissingGreenlet
+    # （SQLAlchemy 错误码 xd2s，见 https://sqlalche.me/e/20/xd2s）。
+    #
+    # 不 flush 是安全的：评分期间 DB 里 status 仍是 NEW，但 worker 用 poll 的
+    # FOR UPDATE SKIP LOCKED 锁事件，同批/跨 worker 不会重复消费；最终 commit 时
+    # `_persist` 会把 status 写成 SCORED。而且去掉 flush 反而更健壮——若评分中途
+    # 崩溃，资讯回到 NEW 可重新评分，而非卡在 SCORING 需要人工修复。
 
     agent = ScoringAgent(settings)
     try:

@@ -70,7 +70,12 @@ async def analyze_news(
     system_prompt, user_template, version = AGENT_CONFIG[agent_type]
     news.status = NewsStatus.ANALYZING
     news.analysis_status = "PENDING"
-    await session.flush()
+    # 注意：这里**故意不 flush**。flush 会让 SQLAlchemy 的 greenlet 上下文残留，
+    # 紧接着 DeepAgents 图的 ainvoke 里 LangChainTracer 回调做 async IO 时会抛
+    # MissingGreenlet（SQLAlchemy xd2s）。并发批量分析时 market_json 已预取传入，
+    # _build_context 不再查库、greenlet 无机会重置，问题必现。
+    # 不 flush 是安全的：分析期间 DB 里 status 仍是 EMBEDDED，但事件靠 poll 的
+    # SKIP LOCKED 保证不重复消费；最终 _persist 会把 status 写成 ANALYZED。
 
     async with stage(
         logger,

@@ -23,6 +23,19 @@ logger = get_logger("pipeline.worker")
 # 需要攒批的事件类型（批量评分），其余事件立即处理
 BATCHED_EVENTS = {EventType.NEWS_INGESTED}
 
+# 慢事件：单批可达数十分钟（深度分析实测平均 70s/条、P95 361s，一批 50 条并发 4
+# 需要十几分钟到几十分钟）。这类事件放到**后台**执行，主循环立即继续 poll ——
+# 否则主循环会卡在 `await tick()` 上，新同步资讯的评分事件一直排不上号。
+SLOW_EVENTS = {EventType.NEWS_EMBEDDED.value}
+
+# 后台慢任务并发上限：既要让分析持续推进，又不能无限堆积把模型额度打满。
+# 达到上限时回退为同步执行（等价于改动前的串行行为，作为安全兜底）。
+MAX_SLOW_TASKS = 2
+
+# 优雅退出时等待后台慢任务收尾的秒数；超时则放弃等待，
+# 遗留的 PROCESSING 事件由下次启动的 reclaim_stale 回收。
+SLOW_TASK_DRAIN_TIMEOUT = 60.0
+
 
 class PipelineWorker:
     def __init__(self, settings: Settings | None = None, worker_id: str | None = None) -> None:
@@ -30,6 +43,8 @@ class PipelineWorker:
         self.worker_id = worker_id or f"{socket.gethostname()}-{id(self) % 10000}"
         self._running = False
         self._batchers: dict[str, Batcher[IngestEvent]] = {}
+        # 后台执行的慢事件任务（深度分析）。与主循环解耦，避免阻塞快事件消费。
+        self._slow_tasks: set[asyncio.Task] = set()
         # 本次运行的累计计数（结束时汇总打印，便于判断跑了多少、失败多少）
         self.stats: dict[str, int] = {
             "ticks": 0,
@@ -68,6 +83,7 @@ class PipelineWorker:
                     self.settings.worker_poll_interval_seconds if not processed else 0.2
                 )
         finally:
+            await self._wait_slow_tasks()  # 先等后台慢任务收尾，再放回攒批事件
             _ = await self.flush()  # 放回攒批器里未处理的事件
             self._running = False
             logger.info(
@@ -129,7 +145,11 @@ class PipelineWorker:
                     batch_size=self.settings.scoring_batch_size,
                 )
                 continue
-            processed += await self._process(event_type, batch)
+            # 慢事件（深度分析）转后台，避免阻塞本轮剩余类型与下一轮 poll
+            if event_type in SLOW_EVENTS:
+                processed += await self._process_slow(event_type, batch)
+            else:
+                processed += await self._process(event_type, batch)
 
         # 未达到触发条件的事件留在攒批器里，等下一轮
         return processed
@@ -197,6 +217,50 @@ class PipelineWorker:
             return len(batch)
         finally:
             unbind_context("event_type")
+
+    async def _process_slow(self, event_type: str, batch: list[IngestEvent]) -> int:
+        """把慢事件转到**后台**执行并立即返回，不阻塞主循环。
+
+        返回 0：这批交由后台任务处理，不计入 `processed`，主循环随即按常规
+        间隔继续 poll，快事件（评分 / 向量化）因此不再被慢分析拖住。
+        """
+        active = sum(1 for t in self._slow_tasks if not t.done())
+        if active >= MAX_SLOW_TASKS:
+            # 后台已满：回退同步执行，避免任务无限堆积（此时行为与改动前一致）
+            logger.info(
+                "后台慢任务已达上限，回退同步执行",
+                event_type=event_type,
+                active=active,
+                limit=MAX_SLOW_TASKS,
+            )
+            return await self._process(event_type, batch)
+
+        task = asyncio.create_task(self._process(event_type, batch))
+        self._slow_tasks.add(task)
+        # 完成后自动移出集合，避免集合无限增长
+        task.add_done_callback(self._slow_tasks.discard)
+        logger.info(
+            "慢事件转入后台执行",
+            event_type=event_type,
+            count=len(batch),
+            active=active + 1,
+            limit=MAX_SLOW_TASKS,
+        )
+        return 0
+
+    async def _wait_slow_tasks(self, timeout: float = SLOW_TASK_DRAIN_TIMEOUT) -> None:
+        """优雅退出：等待后台慢任务收尾；超时则放弃（遗留事件由 reclaim 回收）。"""
+        pending = [t for t in self._slow_tasks if not t.done()]
+        if not pending:
+            return
+        logger.info("等待后台慢任务收尾", count=len(pending), timeout=timeout)
+        _done, still_pending = await asyncio.wait(pending, timeout=timeout)
+        if still_pending:
+            logger.warning(
+                "后台慢任务超时未结束，放弃等待",
+                count=len(still_pending),
+                hint="遗留的 PROCESSING 事件将在下次启动时被 reclaim 回收",
+            )
 
     async def flush(self) -> int:
         """优雅退出：把攒批器中未处理的事件放回队列。返回放回条数。"""
