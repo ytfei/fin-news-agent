@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Annotated, Literal
@@ -64,6 +65,46 @@ def parse_json_dict(value: object) -> dict[str, dict[str, float]]:
     if isinstance(parsed, dict):
         return {str(k): v for k, v in parsed.items() if isinstance(v, dict)}
     return {}
+
+
+# 引号被 shell 吃掉后的形态：{wechat_article:[a,b],stock:[c]}
+# 也兼容单个值写法：{wechat_article:witty-tone}
+_UNQUOTED_KV_RE = re.compile(r"([A-Za-z0-9_\-]+)\s*:\s*(?:\[([^\]]*)\]|([^,}\s]+))")
+
+
+def _parse_unquoted_str_list_dict(text: str) -> dict[str, list[str]]:
+    """解析引号被 shell 吃掉的 `key:[值列表]` 形态（json.loads 无法处理）。"""
+    result: dict[str, list[str]] = {}
+    for m in _UNQUOTED_KV_RE.finditer(text.strip().strip("{}")):
+        key = m.group(1)
+        raw = m.group(2) if m.group(2) is not None else (m.group(3) or "")
+        result[key] = parse_str_list(raw)
+    return result
+
+
+def parse_json_str_list_dict(value: object) -> dict[str, list[str]]:
+    """把 ".env / 环境变量" 里的 JSON 对象解析成 dict[str, list[str]]。
+
+    用于 `SKILLS_ENABLED` 这类「key -> 名称列表」配置（哪些 Agent 启用哪些技能）。
+
+    容错分两级（与 parse_str_list 同源）：先按合法 JSON 解析；失败则回退到
+    `key:[a,b]` 的无引号形态 —— shell source .env 会吃掉引号，而技能是强制项，
+    解析失败导致「配了却没加载」会很难排查，所以必须兜住。
+    """
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return {str(k): parse_str_list(v) for k, v in value.items()}
+    text = str(value).strip()
+    if not text or text in ("{}", "[]", "null", "None"):
+        return {}
+    try:
+        parsed = json.loads(text)
+    except (ValueError, TypeError):
+        parsed = None
+    if isinstance(parsed, dict):
+        return {str(k): parse_str_list(v) for k, v in parsed.items()}
+    return _parse_unquoted_str_list_dict(text)
 
 
 @dataclass(frozen=True)
@@ -224,6 +265,21 @@ class Settings(BaseSettings):
     langchain_project: str = "fin-news-v5"
 
     # ---------------- Skills / 微信公众号 ----------------
+    # 技能搜索路径：**按序查找**，给定技能名命中第一个存在的即停。
+    # 相对路径按进程工作目录解析；默认包含项目内的 skills 子目录，
+    # 可再追加个人级 / 团队级目录（后者作为兜底补充）。
+    # 例：SKILLS_SEARCH_PATHS=["skills","~/.fin-news/skills","/opt/fin-news/skills"]
+    skills_search_paths: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["skills"]
+    )
+    # 各 Agent 启用的技能名称：key 用 agent_type 的 value（macro_policy / industry /
+    # stock / pre_market / post_market / wechat_article），value 为技能目录名列表。
+    #
+    # ⚠️ 技能是**强制项**：配置了但所有搜索路径都找不到时**直接报错中断**，不静默
+    # 跳过 —— 配置里写了技能就代表这个 Agent 必须带上它，静默降级会让问题被藏住。
+    #
+    # 例：SKILLS_ENABLED={"wechat_article":["witty-tone"],"macro_policy":["policy-gauge"]}
+    skills_enabled: Annotated[dict[str, list[str]], NoDecode] = Field(default_factory=dict)
     # 写文章 Agent 的 skills 目录（提示词型 SKILL.md + 工具型 tool.py），
     # 相对路径按进程工作目录解析；CLI `article write --skills-dir` 可覆盖。
     skills_dir: str = "skills"
@@ -275,6 +331,7 @@ class Settings(BaseSettings):
         "cors_origins",
         "web_search_include_domains",
         "web_search_exclude_domains",
+        "skills_search_paths",
         mode="before",
     )
     @classmethod
@@ -285,6 +342,11 @@ class Settings(BaseSettings):
     @classmethod
     def _coerce_json_dict(cls, value: object) -> dict[str, dict[str, float]]:
         return parse_json_dict(value)
+
+    @field_validator("skills_enabled", mode="before")
+    @classmethod
+    def _coerce_skills_enabled(cls, value: object) -> dict[str, list[str]]:
+        return parse_json_str_list_dict(value)
 
     # ---------------- 派生方法 ----------------
     def provider(self, name: ProviderName) -> ProviderConfig:

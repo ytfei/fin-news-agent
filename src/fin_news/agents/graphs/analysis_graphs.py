@@ -35,6 +35,7 @@ from fin_news.agents.prompts import (
     WECHAT_VERSION,
 )
 from fin_news.agents.schemas import AnalysisPayload, ArticlePayload
+from fin_news.agents.skills import SkillsSetup
 from fin_news.agents.tools.langchain_tools import (
     article_search as article_search_tool,
 )
@@ -269,12 +270,17 @@ def build_analysis_graph(
     response_format: Any = None,
     system_prompt: str | None = None,
     extra_tools: list[Any] | None = None,
+    skills: SkillsSetup | None = None,
 ):
     """构建 DeepAgents 图。
 
     - response_format：可注入（测试用），默认按 provider + agent 选择。
-    - system_prompt / extra_tools：供「skills」注入用 —— 公众号文章 Agent 会动态
-      追加提示词型技能的正文，并挂入工具型技能。
+    - system_prompt：覆盖默认提示词。
+    - extra_tools：追加工具 —— **工具型**技能（`tool.py`）走这里。
+    - skills：**提示词型**技能的装配结果（DeepAgents 原生）。原生只把
+      name+description+path 放进 system prompt，正文由 Agent 用 `read_file`
+      按需读取（渐进式披露，技能多时显著省 token）。传 None 表示不启用技能，
+      行为与接入前完全一致。
     """
     from deepagents import create_deep_agent
 
@@ -293,6 +299,14 @@ def build_analysis_graph(
     subagents = _subagents_for(agent_type, settings)
 
     rf = response_format if response_format is not None else _response_format_for(agent_type, settings)
+
+    # 原生技能（提示词型）必须 skills 与 backend **成对**传入：只给 skills 会让
+    # 原生用默认 StateBackend 去读技能目录，结果技能列表为空且无任何报错。
+    native_kwargs: dict[str, Any] = {}
+    if skills is not None:
+        native_kwargs["skills"] = list(skills.sources)
+        native_kwargs["backend"] = skills.backend
+
     return create_deep_agent(
         model=model,
         tools=tools,
@@ -300,6 +314,7 @@ def build_analysis_graph(
         subagents=subagents,
         response_format=rf,
         name=f"fin-news-{agent_type.value}",
+        **native_kwargs,
     )
 
 
@@ -358,22 +373,54 @@ def _main_tools(agent_type: AgentType, settings: Settings) -> list[Any]:
     return tools
 
 
-_graphs: dict[tuple[AgentType, str, str, str], Any] = {}
+def _tool_name(tool: Any) -> str:
+    """取工具名用于缓存键：LangChain 工具用 .name，裸函数用 __name__。"""
+    return str(
+        getattr(tool, "name", None) or getattr(tool, "__name__", "") or id(tool)
+    )
 
 
-def get_analysis_graph(agent_type: AgentType, settings: Settings | None = None) -> Any:
-    """按 (agent_type, prompt_version, provider, model) 缓存已编译的图。"""
+_graphs: dict[tuple[AgentType, str, str, str, tuple[str, ...], tuple[str, ...]], Any] = {}
+
+
+def get_analysis_graph(
+    agent_type: AgentType,
+    settings: Settings | None = None,
+    *,
+    skills: SkillsSetup | None = None,
+    extra_tools: list[Any] | None = None,
+) -> Any:
+    """按 (agent_type, prompt_version, provider, model, 技能, 工具) 缓存已编译的图。
+
+    缓存键纳入**已启用技能名**与**工具型技能名**：切换技能配置时必须重建图，
+    否则会命中旧图让新配置静默失效。
+
+    注意技能**正文**的变化**无需**重建图 —— 原生在 `before_agent` 每次运行时
+    从 Backend 现读，这正是原生方案优于「把正文拼进 system prompt」的关键点。
+    """
     settings = settings or get_settings()
     _system_prompt, version = AGENT_GRAPH_CONFIG[agent_type]
+    skill_names = tuple(skills.names) if skills is not None else ()
+    tool_names = tuple(_tool_name(t) for t in (extra_tools or []))
     key = (
         agent_type,
         version,
         settings.llm_default_provider,
         settings.model_for(settings.llm_default_provider, "analysis"),
+        skill_names,
+        tool_names,
     )
     if key not in _graphs:
-        _graphs[key] = build_analysis_graph(agent_type, settings)
-        logger.info("构建分析 Agent 图", agent=agent_type.value, version=version)
+        _graphs[key] = build_analysis_graph(
+            agent_type, settings, extra_tools=extra_tools, skills=skills
+        )
+        logger.info(
+            "构建分析 Agent 图",
+            agent=agent_type.value,
+            version=version,
+            skills=list(skill_names),
+            extra_tools=list(tool_names),
+        )
     return _graphs[key]
 
 

@@ -21,6 +21,11 @@ from fin_news.agents.prompts import (
     STOCK_VERSION,
 )
 from fin_news.agents.registry import get_agent
+from fin_news.agents.skills import (
+    build_skills_setup,
+    enabled_skill_names,
+    with_skills_fallback,
+)
 from fin_news.agents.tools.market_data import latest_trade_date, market_snapshot
 from fin_news.core.config import Settings, get_settings
 from fin_news.core.enums import AgentType, NewsStatus, ReportStatus
@@ -164,8 +169,15 @@ async def _run_analysis(
                 agent=agent_type.value,
                 timeout_seconds=settings.analysis_timeout_seconds,
             )
+            # 技能装配：按 settings 取本 Agent 启用的技能名。技能是强制项，
+            # 配置了却找不到会直接抛错中断，不静默降级。
+            skills = build_skills_setup(
+                enabled_skill_names(agent_type, settings),
+                settings.skills_search_paths,
+                agent=agent_type.value,
+            )
             # 经 registry 拿缓存图：统一入口（deepagents 分支内部委托 get_analysis_graph）
-            graph = get_agent(agent_type, settings)
+            graph = get_agent(agent_type, settings, skills=skills)
             run = await run_analysis(agent_type, user_prompt, settings, graph=graph)
             logger.info(
                 "DeepAgents 图执行结束",
@@ -197,7 +209,13 @@ async def _run_analysis(
                 error=str(exc)[:300],
             )
     logger.info("单次结构化调用开始", agent=agent_type.value)
-    return await _run_plain_agent(system_prompt, user_prompt, settings)
+    # 降级为单次调用时不走原生中间件，技能本会失效；而技能是强制项，
+    # 故在此改为全量注入兜底（正常路径仍是原生的渐进式披露）。
+    return await _run_plain_agent(
+        with_skills_fallback(system_prompt, agent_type, settings),
+        user_prompt,
+        settings,
+    )
 
 
 # ----------------------------------------------------------------------

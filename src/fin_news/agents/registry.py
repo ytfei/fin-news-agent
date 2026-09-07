@@ -13,6 +13,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from fin_news.agents.skills import SkillsSetup
 from fin_news.core.config import LLMRole, Settings, get_settings
 from fin_news.core.enums import AgentType
 from fin_news.core.logging import get_logger
@@ -159,8 +160,16 @@ def _cache_key(
     )
 
 
-def get_agent(agent_type: AgentType, settings: Any | None = None) -> Any:
-    """按需构建并缓存 Agent 图（键 = agent_type + version + provider + model）。
+def get_agent(
+    agent_type: AgentType,
+    settings: Any | None = None,
+    *,
+    skills: SkillsSetup | None = None,
+) -> Any:
+    """按需构建并缓存 Agent 图。
+
+    缓存键 = agent_type + version + provider + model + **已启用技能名**。
+    技能名入键，保证切换技能配置时不会命中旧图。
 
     deepagents 框架委托给 analysis_graphs.get_analysis_graph，避免两套缓存。
     """
@@ -180,7 +189,7 @@ def get_agent(agent_type: AgentType, settings: Any | None = None) -> Any:
     if spec.framework == "deepagents":
         from fin_news.agents.graphs.analysis_graphs import get_analysis_graph
 
-        return get_analysis_graph(agent_type, settings)
+        return get_analysis_graph(agent_type, settings, skills=skills)
 
     _ensure_builders()
     key = _cache_key(agent_type, spec, settings)

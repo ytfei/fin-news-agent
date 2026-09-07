@@ -1,5 +1,13 @@
 """Skills 加载器：扫描 skills 目录，加载提示词型 + 工具型技能。
 
+两种用法
+--------
+1. **按名称解析**（生产代码走这条）：`registry.resolve_skills` 按 settings 配置的
+   技能名去搜索路径查找；提示词型交给 **DeepAgents 原生**中间件做渐进式披露，
+   工具型用本模块的 `load_tool_skills` 挂进 Agent 的 tools。
+2. **全目录扫描**（本模块的 `load_skills`）：一次性读出目录下所有技能，适合运维
+   盘点，以及不走原生中间件时的兜底注入（`registry.with_skills_fallback`）。
+
 目录约定（每个技能一个子目录）：
     skills/
     └── <skill-name>/
@@ -162,3 +170,18 @@ def render_prompt_suffix(bundle: SkillsBundle) -> str:
             blocks.append(skill.body)
         blocks.append("")
     return "\n".join(blocks).rstrip() + "\n"
+
+
+def load_tool_skills(skill_dirs: list[Path]) -> list[Any]:
+    """从指定技能目录加载**工具型**技能（`tool.py` -> `get_tool()`）。
+
+    与 `load_skills` 的差别：只取工具型，且目录由调用方**按名称解析后**给定 ——
+    适配「settings 按名称启用」的新流程（提示词型已改由 DeepAgents 原生加载，
+    原生不支持通过技能定义新工具，所以工具型仍需这条自研路径）。
+
+    单个技能加载失败只告警，不影响其余。
+    """
+    tools: list[Any] = []
+    for d in skill_dirs:
+        tools.extend(_load_tool_skills(Path(d)))
+    return tools

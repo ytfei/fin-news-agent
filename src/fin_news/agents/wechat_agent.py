@@ -23,7 +23,11 @@ from fin_news.agents.prompts import (
     WECHAT_USER_TEMPLATE,
     WECHAT_VERSION,
 )
-from fin_news.agents.skills import load_skills, render_prompt_suffix
+from fin_news.agents.skills import (
+    build_skills_setup,
+    enabled_skill_names,
+    load_tool_skills,
+)
 from fin_news.core.config import Settings, get_settings
 from fin_news.core.enums import AgentType, ArticleStatus
 from fin_news.core.logging import get_logger
@@ -46,8 +50,16 @@ async def write_article(
     """为指定交易日写一篇公众号文章。无可用资讯时返回 None。"""
     settings = settings or get_settings()
 
-    # 1) 加载 skills
-    bundle = load_skills(skills_dir, settings)
+    # 1) 技能装配：提示词型走 DeepAgents 原生（渐进式披露，正文由 Agent 按需
+    #    read_file），工具型（tool.py）原生不支持，继续走 extra_tools。
+    #    CLI 的 --skills-dir 优先于配置里的搜索路径。
+    search_paths = [skills_dir] if skills_dir else settings.skills_search_paths
+    skills = build_skills_setup(
+        enabled_skill_names(AgentType.WECHAT_ARTICLE, settings),
+        search_paths,
+        agent=AgentType.WECHAT_ARTICLE.value,
+    )
+    tool_skills = load_tool_skills([r.skill_dir for r in (skills.refs if skills else ())])
 
     # 2) 筛选当日高评分资讯 + 市场快照
     news_items = await _select_daily_news(session, publish_date, settings)
@@ -55,7 +67,9 @@ async def write_article(
         logger.warning("当日无可用资讯，跳过写文章", publish_date=str(publish_date))
         return None
 
-    system_prompt = WECHAT_SYSTEM + render_prompt_suffix(bundle)
+    # 提示词型技能不再拼进 system prompt：原生 SkillsMiddleware 只注入
+    # name+description+path，正文由 Agent 判定相关后自行 read_file（省 token）
+    system_prompt = WECHAT_SYSTEM
     user_prompt = WECHAT_USER_TEMPLATE.format(
         trade_date=publish_date.isoformat(),
         market=await _market_context(session, publish_date),
@@ -66,18 +80,19 @@ async def write_article(
         "公众号文章 Agent 开始",
         publish_date=str(publish_date),
         news_count=len(news_items),
-        prompt_skills=len(bundle.prompt_skills),
-        tool_skills=len(bundle.tool_skills),
+        skills=list(skills.names) if skills else [],
+        tool_skills=len(tool_skills),
         model=settings.model_for(settings.llm_default_provider, "analysis"),
         prompt_version=WECHAT_VERSION,
     )
 
-    # 3) 构图 + 执行（skills 动态注入，不缓存图）
+    # 3) 构图 + 执行
     graph = build_analysis_graph(
         AgentType.WECHAT_ARTICLE,
         settings,
         system_prompt=system_prompt,
-        extra_tools=bundle.tool_skills,
+        extra_tools=tool_skills,
+        skills=skills,
     )
     run = await run_analysis(
         AgentType.WECHAT_ARTICLE,

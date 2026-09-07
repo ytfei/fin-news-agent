@@ -19,6 +19,11 @@ from fin_news.agents.prompts import (
     PRE_MARKET_VERSION,
 )
 from fin_news.agents.registry import get_agent
+from fin_news.agents.skills import (
+    build_skills_setup,
+    enabled_skill_names,
+    with_skills_fallback,
+)
 from fin_news.agents.tools.market_data import (
     high_score_news,
     is_trading_day,
@@ -134,8 +139,14 @@ async def _run_brief_agent(
     """
     if settings.agent_framework == "langgraph" and settings.use_deep_agents:
         try:
+            # 技能装配：按 settings 取本 Agent 启用的技能名（缺失即中断）
+            skills = build_skills_setup(
+                enabled_skill_names(agent_type, settings),
+                settings.skills_search_paths,
+                agent=agent_type.value,
+            )
             # 经 registry 拿缓存图：统一入口（deepagents 分支委托 get_analysis_graph）
-            graph = get_agent(agent_type, settings)
+            graph = get_agent(agent_type, settings, skills=skills)
             # 简报走深度多轮 ReAct（子 agent 并行 + 外部检索），用更宽松的耗时预算
             run = await run_analysis(
                 agent_type,
@@ -169,7 +180,13 @@ async def _run_brief_agent(
                 agent=agent_type.value,
                 error=str(exc)[:300],
             )
-    return await _run_plain_agent(system_prompt, user_prompt, settings)
+    # 降级为单次调用时不走原生中间件，技能本会失效；技能是强制项，
+    # 故在此改为全量注入兜底（正常路径仍是原生的渐进式披露）。
+    return await _run_plain_agent(
+        with_skills_fallback(system_prompt, agent_type, settings),
+        user_prompt,
+        settings,
+    )
 
 
 async def _build_context(
