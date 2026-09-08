@@ -35,6 +35,9 @@ dependencies = [
     "structlog>=24.1",
     "tavily-python>=0.8.0",
     "plotext>=6.0.0",
+    # jimeng-api skill（selftest 子进程脚本的硬依赖 requests / 软依赖 Pillow）
+    "requests>=2.28.0",
+    "Pillow>=9.0.0",
 ]
 
 # 用 dependency-groups 而不是 optional-dependencies：

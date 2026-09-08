@@ -34,3 +34,5 @@ web/.vite/
 .idea/
 .vscode/
 .DS_Store
+
+/pic/

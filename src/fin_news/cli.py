@@ -12,7 +12,7 @@
     uv run python -m fin_news.cli premarket        # 生成盘前简报
     uv run python -m fin_news.cli postmarket       # 生成盘后简报
     uv run python -m fin_news.cli status           # 查看积压与统计
-    uv run python -m fin_news.cli selftest         # 数据源 / LLM / Embedding 连通性自检
+    uv run python -m fin_news.cli selftest         # 数据源 / LLM / Embedding / 即梦文生图 skill 自检
 
     # 微信公众号文章
     uv run python -m fin_news.cli article list                  # 列出文章
@@ -1071,7 +1071,7 @@ async def _cmd_cost_recalc(*, apply: bool) -> int:
 
 
 async def _cmd_selftest() -> int:
-    """数据源 / LLM / Embedding 连通性自检。"""
+    """数据源 / LLM / Embedding / 即梦文生图 skill 连通性自检。"""
     logger = get_logger(_LOG_NAME)
     settings = get_settings()
     logger.info(
@@ -1083,14 +1083,16 @@ async def _cmd_selftest() -> int:
     source_ok = await _selftest_sources(settings)
     llm_ok = await _selftest_llm(settings)
     embed_ok = await _selftest_embedding(settings)
+    jimeng_ok = await _selftest_jimeng()
 
-    all_ok = source_ok and llm_ok and embed_ok
+    all_ok = source_ok and llm_ok and embed_ok and jimeng_ok
     logger.info(
         "自检结果",
         result="全部通过" if all_ok else "存在问题",
         sources=source_ok,
         llm=llm_ok,
         embedding=embed_ok,
+        jimeng=jimeng_ok,
     )
     return 0 if all_ok else 1
 
@@ -1241,6 +1243,59 @@ async def _selftest_embedding(settings: Settings) -> bool:
 
     # 与数据库列类型 / 维度 / 索引一致性校验（这三项不一致会在入库或建索引时才炸）
     return await _check_vector_column(vec)
+
+
+async def _selftest_jimeng() -> bool:
+    """即梦文生图 skill 自检：subprocess 跑 generate_image.py 生成并下载一张图。
+
+    sessionid 从环境变量 JIMENG_SESSION_ID 读取（凭据不落代码）；未设置则跳过。
+    成功判定：脚本返回码为 0 且输出含下载成功标志「Downloaded」。
+    """
+    import os
+    import subprocess
+    from pathlib import Path
+
+    logger = get_logger(_LOG_NAME)
+    session_id = os.environ.get("JIMENG_SESSION_ID")
+    if not session_id:
+        logger.warning(
+            "即梦自检跳过", detail="未设置环境变量 JIMENG_SESSION_ID，无法调用即梦文生图 skill"
+        )
+        return True
+
+    # 脚本路径不依赖 cwd：cli.py 位于 src/fin_news/，往上两级即项目根
+    script = (
+        Path(__file__).resolve().parents[2] / "skills" / "jimeng-api" / "scripts" / "generate_image.py"
+    )
+    if not script.is_file():
+        logger.error("即梦自检失败", detail=f"脚本不存在：{script}")
+        return False
+
+    prompt = "一只可爱的橘猫在草地上晒太阳"
+    try:
+        result = subprocess.run(
+            [sys.executable, str(script), "text", prompt, "--session-id", session_id],
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+    except subprocess.TimeoutExpired:
+        logger.error("即梦自检失败", detail="脚本执行超时（300 秒）")
+        return False
+    except Exception as exc:  # noqa: BLE001
+        logger.error("即梦自检失败", detail=f"{type(exc).__name__} -> {str(exc)[:200]}")
+        return False
+
+    ok = result.returncode == 0 and "Downloaded" in result.stdout
+    if ok:
+        logger.info("即梦自检通过", returncode=result.returncode)
+    else:
+        logger.error(
+            "即梦自检失败",
+            returncode=result.returncode,
+            detail=(result.stderr or result.stdout or "").strip()[-300:],
+        )
+    return ok
 
 
 async def _probe_embedding_dim(embedder: Embedder) -> int | None:

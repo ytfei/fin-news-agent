@@ -18,7 +18,7 @@
 """
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -148,7 +148,7 @@ def build_scheduler(settings: Settings | None = None) -> AsyncIOScheduler:
         trigger=IntervalTrigger(seconds=settings.ingest_interval_seconds),
         id="ingest",
         name="分钟级增量接入",
-        next_run_time=datetime.now(timezone.utc),
+        next_run_time=datetime.now(UTC),
         replace_existing=True,
     )
     scheduler.add_job(
