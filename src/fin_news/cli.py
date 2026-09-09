@@ -1246,55 +1246,59 @@ async def _selftest_embedding(settings: Settings) -> bool:
 
 
 async def _selftest_jimeng() -> bool:
-    """即梦文生图 skill 自检：subprocess 跑 generate_image.py 生成并下载一张图。
+    """即梦文生图 skill 自检：装配一个带 jimeng 工具的 DeepAgent，用提示词触发。
 
     sessionid 从环境变量 JIMENG_SESSION_ID 读取（凭据不落代码）；未设置则跳过。
-    成功判定：脚本返回码为 0 且输出含下载成功标志「Downloaded」。
+    验证：Agent 按提示词调用 jimeng 工具后，pic/ 目录应新增图片文件。
     """
     import os
-    import subprocess
     from pathlib import Path
 
+    from fin_news.agents.graphs.analysis_graphs import build_agent, invoke_agent
+    from fin_news.agents.skills.loader import load_tool_skills
+
     logger = get_logger(_LOG_NAME)
-    session_id = os.environ.get("JIMENG_SESSION_ID")
-    if not session_id:
+    if not os.environ.get("JIMENG_SESSION_ID"):
         logger.warning(
             "即梦自检跳过", detail="未设置环境变量 JIMENG_SESSION_ID，无法调用即梦文生图 skill"
         )
         return True
 
-    # 脚本路径不依赖 cwd：cli.py 位于 src/fin_news/，往上两级即项目根
-    script = (
-        Path(__file__).resolve().parents[2] / "skills" / "jimeng-api" / "scripts" / "generate_image.py"
-    )
-    if not script.is_file():
-        logger.error("即梦自检失败", detail=f"脚本不存在：{script}")
+    # 装配：加载 jimeng-api 的工具型技能（tool.py -> get_tool()）
+    skill_dir = Path(__file__).resolve().parents[2] / "skills" / "jimeng-api"
+    tools = load_tool_skills([skill_dir])
+    if not tools:
+        logger.error("即梦自检失败", detail=f"jimeng-api 未提供工具（缺 tool.py）：{skill_dir}")
         return False
 
-    prompt = "一只可爱的橘猫在草地上晒太阳"
+    graph = build_agent(
+        tools=tools,
+        system_prompt=(
+            "你是即梦文生图测试助手。当用户要求生成图片时，必须调用 jimeng_text2image 工具完成，"
+            "并原样报告工具返回的图片文件路径。"
+        ),
+        name="jimeng-selftest",
+    )
+
+    # 记录 pic/ 目录现有文件，用于判定「是否真的生成了新图片」
+    pic_dir = Path(__file__).resolve().parents[2] / "pic"
+    before = {p.name for p in pic_dir.glob("jimeng_*.png")} if pic_dir.is_dir() else set()
+
+    # 使用：用提示词触发 Agent 调用 jimeng 工具
+    prompt = "请生成一张可爱的橘猫在草地上晒太阳的图片"
     try:
-        result = subprocess.run(
-            [sys.executable, str(script), "text", prompt, "--session-id", session_id],
-            capture_output=True,
-            text=True,
-            timeout=300,
-        )
-    except subprocess.TimeoutExpired:
-        logger.error("即梦自检失败", detail="脚本执行超时（300 秒）")
-        return False
+        answer = await invoke_agent(graph, prompt, timeout_seconds=300)
     except Exception as exc:  # noqa: BLE001
         logger.error("即梦自检失败", detail=f"{type(exc).__name__} -> {str(exc)[:200]}")
         return False
 
-    ok = result.returncode == 0 and "Downloaded" in result.stdout
+    after = {p.name for p in pic_dir.glob("jimeng_*.png")} if pic_dir.is_dir() else set()
+    new_files = after - before
+    ok = bool(new_files)
     if ok:
-        logger.info("即梦自检通过", returncode=result.returncode)
+        logger.info("即梦自检通过", files=sorted(new_files))
     else:
-        logger.error(
-            "即梦自检失败",
-            returncode=result.returncode,
-            detail=(result.stderr or result.stdout or "").strip()[-300:],
-        )
+        logger.error("即梦自检失败", detail=answer[:300] or "Agent 未返回有效结果")
     return ok
 
 

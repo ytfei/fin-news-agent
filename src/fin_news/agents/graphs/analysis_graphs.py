@@ -318,6 +318,44 @@ def build_analysis_graph(
     )
 
 
+def build_agent(
+    *,
+    tools: list[Any],
+    system_prompt: str,
+    skills: SkillsSetup | None = None,
+    model_role: str = "analysis",
+    name: str = "fin-news-agent",
+    settings: Settings | None = None,
+) -> Any:
+    """构建一个通用 DeepAgent（装配层），不绑定具体业务 Agent。
+
+    与 `build_analysis_graph` 的差别：后者按 agent_type 装配业务专属的工具集 /
+    子 agent / 结构化输出；本函数是更底层、可复用于任意测试 / 轻量场景的入口，
+    只关心「给哪些工具 + 什么提示词 + 哪些技能」，返回编译后的图。
+
+    典型用途：给某个「工具型 skill」做自检——加载它的 tool.py 得到工具，
+    用本函数装配一个只带该工具的 Agent，再用 `invoke_agent` 以提示词触发。
+    """
+    from deepagents import create_deep_agent
+
+    settings = settings or get_settings()
+    model = get_model_factory(settings).chat(model_role, with_fallback=False)
+
+    # 提示词型技能（原生）必须 skills 与 backend 成对传入，同 build_analysis_graph
+    native_kwargs: dict[str, Any] = {}
+    if skills is not None:
+        native_kwargs["skills"] = list(skills.sources)
+        native_kwargs["backend"] = skills.backend
+
+    return create_deep_agent(
+        model=model,
+        tools=list(tools),
+        system_prompt=system_prompt,
+        name=name,
+        **native_kwargs,
+    )
+
+
 # 主 agent 工具集：声明式映射（新增 Agent 只改这张表，不再加特判分支）
 MAIN_TOOLS: dict[AgentType, tuple[Any, ...]] = {
     # 宏观：需要外部信息（市场预期 / 海外反应）
@@ -545,3 +583,36 @@ async def run_analysis(
         completion_tokens=completion_tokens,
         latency_ms=latency_ms,
     )
+
+
+async def invoke_agent(
+    graph: Any,
+    user_prompt: str,
+    *,
+    timeout_seconds: int = 300,
+    recursion_limit: int | None = None,
+    settings: Settings | None = None,
+) -> str:
+    """用提示词调用一个已装配的 Agent（使用层），返回最终回答文本。
+
+    与 `run_analysis` 的差别：后者面向「分析」场景，绑定 agent_type 并提取
+    Pydantic 结构化输出；本函数是通用入口，只关心「把提示词喂给图，拿回最终
+    文本回答」，适合工具型 skill 自检等轻量场景（配合 `build_agent`）。
+
+    返回最后一条 AI 消息的文本；图中没有 AI 消息时返回空串。
+    """
+    settings = settings or get_settings()
+    limit = recursion_limit or settings.agent_recursion_limit
+    result = await asyncio.wait_for(
+        graph.ainvoke(
+            {"messages": [HumanMessage(content=user_prompt)]},
+            config={"recursion_limit": limit},
+        ),
+        timeout=timeout_seconds,
+    )
+    messages = result.get("messages") or []
+    for msg in reversed(messages):
+        text = getattr(msg, "content", None)
+        if isinstance(text, str) and text.strip():
+            return text.strip()
+    return ""
